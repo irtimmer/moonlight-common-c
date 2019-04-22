@@ -52,12 +52,6 @@ typedef socklen_t SOCKADDR_LEN;
 
 #if defined(__vita__)
 #define TCP_NODELAY SCE_NET_TCP_NODELAY
-#undef EAGAIN
-#undef EWOULDBLOCK
-#undef EINTR
-#define EAGAIN SCE_NET_EAGAIN
-#define EWOULDBLOCK SCE_NET_EWOULDBLOCK
-#define EINTR SCE_NET_EINTR
 
 #define sockaddr_in6 sockaddr_in
 #define sin6_addr sin_addr
@@ -82,3 +76,6 @@ int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs);
 void setRecvTimeout(SOCKET s, int timeoutSec);
 void closeSocket(SOCKET s);
 int isPrivateNetworkAddress(struct sockaddr_storage* address);
+
+int initializePlatformSockets(void);
+void cleanupPlatformSockets(void);

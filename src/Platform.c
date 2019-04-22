@@ -3,6 +3,10 @@
 
 #include <enet/enet.h>
 
+// The maximum amount of time before observing an interrupt
+// in PltSleepMsInterruptible().
+#define INTERRUPT_PERIOD_MS 50
+
 int initializePlatformSockets(void);
 void cleanupPlatformSockets(void);
 
@@ -14,7 +18,9 @@ struct thread_context {
 #endif
 };
 
-static int running_threads = 0;
+static int activeThreads = 0;
+static int activeMutexes = 0;
+static int activeEvents = 0;
 
 #if defined(LC_WINDOWS)
 DWORD WINAPI ThreadProc(LPVOID lpParameter) {
@@ -53,25 +59,37 @@ void PltSleepMs(int ms) {
 #endif
 }
 
+void PltSleepMsInterruptible(PLT_THREAD* thread, int ms) {
+    while (ms > 0 && !PltIsThreadInterrupted(thread)) {
+        int msToSleep = ms < INTERRUPT_PERIOD_MS ? ms : INTERRUPT_PERIOD_MS;
+        PltSleepMs(msToSleep);
+        ms -= msToSleep;
+    }
+}
+
 int PltCreateMutex(PLT_MUTEX* mutex) {
 #if defined(LC_WINDOWS)
     *mutex = CreateMutexEx(NULL, NULL, 0, MUTEX_ALL_ACCESS);
     if (!*mutex) {
         return -1;
     }
-    return 0;
 #elif defined(__vita__)
     *mutex = sceKernelCreateMutex("", 0, 0, NULL);
     if (*mutex < 0) {
         return -1;
     }
-    return 0;
 #else
-    return pthread_mutex_init(mutex, NULL);
+    int err = pthread_mutex_init(mutex, NULL);
+    if (err != 0) {
+        return err;
+    }
 #endif
+    activeMutexes++;
+    return 0;
 }
 
 void PltDeleteMutex(PLT_MUTEX* mutex) {
+    activeMutexes--;
 #if defined(LC_WINDOWS)
     CloseHandle(*mutex);
 #elif defined(__vita__)
@@ -121,7 +139,7 @@ void PltJoinThread(PLT_THREAD* thread) {
 }
 
 void PltCloseThread(PLT_THREAD* thread) {
-	running_threads--;
+    activeThreads--;
 #if defined(LC_WINDOWS)
     CloseHandle(thread->handle);
 #elif defined(__vita__)
@@ -180,7 +198,7 @@ int PltCreateThread(ThreadEntry entry, void* context, PLT_THREAD* thread) {
     }
 #endif
 
-	running_threads++;
+    activeThreads++;
 
     return 0;
 }
@@ -191,8 +209,6 @@ int PltCreateEvent(PLT_EVENT* event) {
     if (!*event) {
         return -1;
     }
-
-    return 0;
 #elif defined(__vita__)
     event->mutex = sceKernelCreateMutex("", 0, 0, NULL);
     if (event->mutex < 0) {
@@ -204,16 +220,17 @@ int PltCreateEvent(PLT_EVENT* event) {
         return -1;
     }
     event->signalled = 0;
-    return 0;
 #else
     pthread_mutex_init(&event->mutex, NULL);
     pthread_cond_init(&event->cond, NULL);
     event->signalled = 0;
-    return 0;
 #endif
+    activeEvents++;
+    return 0;
 }
 
 void PltCloseEvent(PLT_EVENT* event) {
+    activeEvents--;
 #if defined(LC_WINDOWS)
     CloseHandle(*event);
 #elif defined(__vita__)
@@ -319,5 +336,7 @@ void cleanupPlatform(void) {
     
     enet_deinitialize();
 
-	LC_ASSERT(running_threads == 0);
+    LC_ASSERT(activeThreads == 0);
+    LC_ASSERT(activeMutexes == 0);
+    LC_ASSERT(activeEvents == 0);
 }

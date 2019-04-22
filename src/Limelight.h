@@ -294,13 +294,6 @@ typedef void(*ConnListenerConnectionStarted)(void);
 // to LiStopConnection() or LiInterruptConnection().
 typedef void(*ConnListenerConnectionTerminated)(long errorCode);
 
-// This callback is invoked to display a dialog-type message to the user
-typedef void(*ConnListenerDisplayMessage)(const char* message);
-
-// This callback is invoked to display a transient message for the user
-// while streaming
-typedef void(*ConnListenerDisplayTransientMessage)(const char* message);
-
 // This callback is invoked to log debug message
 typedef void(*ConnListenerLogMessage)(const char* format, ...);
 
@@ -311,16 +304,24 @@ typedef void(*ConnListenerLogMessage)(const char* format, ...);
 // physically present, so your callback should handle this possibility.
 typedef void(*ConnListenerRumble)(unsigned short controllerNumber, unsigned short lowFreqMotor, unsigned short highFreqMotor);
 
+// This callback is used to notify the client of a connection status change.
+// Consider displaying an overlay for the user to notify them why their stream
+// is not performing as expected.
+#define CONN_STATUS_OKAY    0
+#define CONN_STATUS_POOR    1
+typedef void(*ConnListenerConnectionStatusUpdate)(int connectionStatus);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
     ConnListenerStageFailed stageFailed;
     ConnListenerConnectionStarted connectionStarted;
     ConnListenerConnectionTerminated connectionTerminated;
-    ConnListenerDisplayMessage displayMessage;
-    ConnListenerDisplayTransientMessage displayTransientMessage;
+    void* deprecated1; // was displayMessage()
+    void* deprecated2; // was displayTransientMessage()
     ConnListenerLogMessage logMessage;
     ConnListenerRumble rumble;
+    ConnListenerConnectionStatusUpdate connectionStatusUpdate;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -416,7 +417,15 @@ int LiSendMultiControllerEvent(short controllerNumber, short activeGamepadMask,
     short leftStickX, short leftStickY, short rightStickX, short rightStickY);
 
 // This function queues a vertical scroll event to the remote server.
+// The number of "clicks" is multiplied by WHEEL_DELTA (120) before
+// being sent to the PC.
 int LiSendScrollEvent(signed char scrollClicks);
+
+// This function queues a vertical scroll event to the remote server.
+// Unlike LiSendScrollEvent(), this function can send wheel events
+// smaller than 120 units for devices that support "high resolution"
+// scrolling (Apple Trackpads, Microsoft Precision Touchpads, etc.).
+int LiSendHighResScrollEvent(short scrollAmount);
 
 // This function returns a time in milliseconds with an implementation-defined epoch.
 // NOTE: This will be populated from gettimeofday() if !HAVE_CLOCK_GETTIME and

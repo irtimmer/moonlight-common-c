@@ -37,8 +37,19 @@ static long lastSeenFrame;
 static int stopping;
 static int disconnectPending;
 
+static int intervalGoodFrameCount;
+static int intervalTotalFrameCount;
+static uint64_t intervalStartTimeMs;
+static int lastIntervalLossPercentage;
+static int lastConnectionStatusUpdate;
+
 static int idrFrameRequired;
 static LINKED_BLOCKING_QUEUE invalidReferenceFrameTuples;
+
+#define CONN_IMMEDIATE_POOR_LOSS_RATE 30
+#define CONN_CONSECUTIVE_POOR_LOSS_RATE 15
+#define CONN_OKAY_LOSS_RATE 5
+#define CONN_STATUS_SAMPLE_PERIOD 3000
 
 #define IDX_START_A 0
 #define IDX_REQUEST_IDR_FRAME 0
@@ -190,6 +201,11 @@ int initializeControlStream(void) {
     lastSeenFrame = 0;
     lossCountSinceLastReport = 0;
     disconnectPending = 0;
+    intervalGoodFrameCount = 0;
+    intervalTotalFrameCount = 0;
+    intervalStartTimeMs = 0;
+    lastIntervalLossPercentage = 0;
+    lastConnectionStatusUpdate = CONN_STATUS_OKAY;
 
     return 0;
 }
@@ -257,9 +273,37 @@ void connectionDetectedFrameLoss(int startFrame, int endFrame) {
 // When we receive a frame, update the number of our current frame
 void connectionReceivedCompleteFrame(int frameIndex) {
     lastGoodFrame = frameIndex;
+    intervalGoodFrameCount++;
 }
 
 void connectionSawFrame(int frameIndex) {
+    uint64_t now = PltGetMillis();
+    if (now - intervalStartTimeMs >= CONN_STATUS_SAMPLE_PERIOD) {
+        if (intervalTotalFrameCount != 0) {
+            // Notify the client of connection status changes based on frame loss rate
+            int frameLossPercent = 100 - (intervalGoodFrameCount * 100) / intervalTotalFrameCount;
+            if (lastConnectionStatusUpdate != CONN_STATUS_POOR &&
+                    (frameLossPercent >= CONN_IMMEDIATE_POOR_LOSS_RATE ||
+                     (frameLossPercent >= CONN_CONSECUTIVE_POOR_LOSS_RATE && lastIntervalLossPercentage >= CONN_CONSECUTIVE_POOR_LOSS_RATE))) {
+                // We require 2 consecutive intervals above CONN_CONSECUTIVE_POOR_LOSS_RATE or a single
+                // interval above CONN_IMMEDIATE_POOR_LOSS_RATE to notify of a poor connection.
+                ListenerCallbacks.connectionStatusUpdate(CONN_STATUS_POOR);
+                lastConnectionStatusUpdate = CONN_STATUS_POOR;
+            }
+            else if (frameLossPercent <= CONN_OKAY_LOSS_RATE && lastConnectionStatusUpdate != CONN_STATUS_OKAY) {
+                ListenerCallbacks.connectionStatusUpdate(CONN_STATUS_OKAY);
+                lastConnectionStatusUpdate = CONN_STATUS_OKAY;
+            }
+
+            lastIntervalLossPercentage = frameLossPercent;
+        }
+
+        // Reset interval
+        intervalStartTimeMs = now;
+        intervalGoodFrameCount = intervalTotalFrameCount = 0;
+    }
+
+    intervalTotalFrameCount += frameIndex - lastSeenFrame;
     lastSeenFrame = frameIndex;
 }
 
@@ -422,7 +466,7 @@ static void controlReceiveThreadFunc(void* context) {
         return;
     }
 
-    unsigned short terminationReason = -1;
+    long terminationErrorCode = -1;
 
     while (!PltIsThreadInterrupted(&controlReceiveThread)) {
         ENetEvent event;
@@ -467,7 +511,7 @@ static void controlReceiveThreadFunc(void* context) {
             }
             else {
                 // No events ready
-                PltSleepMs(100);
+                PltSleepMsInterruptible(&controlReceiveThread, 100);
                 continue;
             }
         }
@@ -490,27 +534,39 @@ static void controlReceiveThreadFunc(void* context) {
             if (ctlHdr->type == packetTypes[IDX_RUMBLE_DATA]) {
                 BYTE_BUFFER bb;
 
-                BbInitializeWrappedBuffer(&bb, event.packet->data, sizeof(*ctlHdr), event.packet->dataLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
+                BbInitializeWrappedBuffer(&bb, (char*)event.packet->data, sizeof(*ctlHdr), event.packet->dataLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
                 BbAdvanceBuffer(&bb, 4);
 
                 unsigned short controllerNumber;
                 unsigned short lowFreqRumble;
                 unsigned short highFreqRumble;
 
-                BbGetShort(&bb, &controllerNumber);
-                BbGetShort(&bb, &lowFreqRumble);
-                BbGetShort(&bb, &highFreqRumble);
+                BbGetShort(&bb, (short*)&controllerNumber);
+                BbGetShort(&bb, (short*)&lowFreqRumble);
+                BbGetShort(&bb, (short*)&highFreqRumble);
 
                 ListenerCallbacks.rumble(controllerNumber, lowFreqRumble, highFreqRumble);
             }
             else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {
                 BYTE_BUFFER bb;
 
-                BbInitializeWrappedBuffer(&bb, event.packet->data, sizeof(*ctlHdr), event.packet->dataLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
+                BbInitializeWrappedBuffer(&bb, (char*)event.packet->data, sizeof(*ctlHdr), event.packet->dataLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
 
-                BbGetShort(&bb, &terminationReason);
+                unsigned short terminationReason;
+
+                BbGetShort(&bb, (short*)&terminationReason);
 
                 Limelog("Server notified termination reason: 0x%04x\n", terminationReason);
+
+                // SERVER_TERMINATED_INTENDED
+                if (terminationReason == 0x0100) {
+                    // Pass error code 0 to notify the client that this was not an error
+                    terminationErrorCode = 0;
+                }
+                else {
+                    // Otherwise pass the reason unmodified
+                    terminationErrorCode = terminationReason;
+                }
 
                 // We don't actually notify the connection listener until we receive
                 // the disconnect event from the server that confirms the termination.
@@ -520,16 +576,7 @@ static void controlReceiveThreadFunc(void* context) {
         }
         else if (event.type == ENET_EVENT_TYPE_DISCONNECT) {
             Limelog("Control stream received disconnect event\n");
-
-            // SERVER_TERMINATED_INTENDED
-            if (terminationReason == 0x0100) {
-                // Pass error code 0 to notify the client that this was not an error
-                ListenerCallbacks.connectionTerminated(0);
-            }
-            else {
-                ListenerCallbacks.connectionTerminated(terminationReason);
-            }
-
+            ListenerCallbacks.connectionTerminated(terminationErrorCode);
             return;
         }
     }
@@ -570,7 +617,7 @@ static void lossStatsThreadFunc(void* context) {
         lossCountSinceLastReport = 0;
 
         // Wait a bit
-        PltSleepMs(LOSS_REPORT_INTERVAL_MS);
+        PltSleepMsInterruptible(&lossStatsThread, LOSS_REPORT_INTERVAL_MS);
     }
 
     free(lossStatsPayload);
