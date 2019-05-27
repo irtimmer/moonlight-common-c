@@ -65,9 +65,7 @@ typedef struct _QUEUED_AUDIO_PACKET {
 
 // Initialize the audio stream
 void initializeAudioStream(void) {
-    if ((AudioCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-        LbqInitializeLinkedBlockingQueue(&packetQueue, 30);
-    }
+    LbqInitializeLinkedBlockingQueue(&packetQueue, 30);
     RtpqInitializeQueue(&rtpReorderQueue, RTPQ_DEFAULT_MAX_SIZE, RTPQ_DEFAULT_QUEUE_TIME);
     lastSeq = 0;
     receivedDataFromPeer = 0;
@@ -88,9 +86,7 @@ static void freePacketList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
 
 // Tear down the audio stream once we're done with it
 void destroyAudioStream(void) {
-    if ((AudioCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-        freePacketList(LbqDestroyLinkedBlockingQueue(&packetQueue));
-    }
+    freePacketList(LbqDestroyLinkedBlockingQueue(&packetQueue));
     RtpqCleanupQueue(&rtpReorderQueue);
 }
 
@@ -161,7 +157,7 @@ static void ReceiveThreadProc(void* context) {
     PQUEUED_AUDIO_PACKET packet;
     int queueStatus;
     int useSelect;
-    int packetsToDrop = 100;
+    int packetsToDrop = 500 / AudioPacketDuration;
 
     packet = NULL;
 
@@ -321,17 +317,17 @@ void stopAudioStream(void) {
 
 int startAudioStream(void* audioContext, int arFlags) {
     int err;
-    POPUS_MULTISTREAM_CONFIGURATION chosenConfig;
+    OPUS_MULTISTREAM_CONFIGURATION chosenConfig;
 
     if (StreamConfig.audioConfiguration == AUDIO_CONFIGURATION_STEREO) {
-        chosenConfig = &opusStereoConfig;
+        chosenConfig = opusStereoConfig;
     }
     else if (StreamConfig.audioConfiguration == AUDIO_CONFIGURATION_51_SURROUND) {
         if (HighQualitySurroundEnabled) {
-            chosenConfig = &opus51HighSurroundConfig;
+            chosenConfig = opus51HighSurroundConfig;
         }
         else {
-            chosenConfig = &opus51SurroundConfig;
+            chosenConfig = opus51SurroundConfig;
         }
     }
     else {
@@ -339,7 +335,9 @@ int startAudioStream(void* audioContext, int arFlags) {
         return -1;
     }
 
-    err = AudioCallbacks.init(StreamConfig.audioConfiguration, chosenConfig, audioContext, arFlags);
+    chosenConfig.samplesPerFrame = 48 * AudioPacketDuration;
+
+    err = AudioCallbacks.init(StreamConfig.audioConfiguration, &chosenConfig, audioContext, arFlags);
     if (err != 0) {
         return err;
     }
@@ -353,7 +351,7 @@ int startAudioStream(void* audioContext, int arFlags) {
 
     AudioCallbacks.start();
 
-    err = PltCreateThread(ReceiveThreadProc, NULL, &receiveThread);
+    err = PltCreateThread("AudioRecv", ReceiveThreadProc, NULL, &receiveThread);
     if (err != 0) {
         AudioCallbacks.stop();
         closeSocket(rtpSocket);
@@ -362,7 +360,7 @@ int startAudioStream(void* audioContext, int arFlags) {
     }
 
     if ((AudioCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-        err = PltCreateThread(DecoderThreadProc, NULL, &decoderThread);
+        err = PltCreateThread("AudioDec", DecoderThreadProc, NULL, &decoderThread);
         if (err != 0) {
             AudioCallbacks.stop();
             PltInterruptThread(&receiveThread);
@@ -378,7 +376,7 @@ int startAudioStream(void* audioContext, int arFlags) {
     // until everything else is started. Otherwise we could accumulate a
     // bunch of audio packets in the socket receive buffer while our audio
     // backend is starting up and create audio latency.
-    err = PltCreateThread(UdpPingThreadProc, NULL, &udpPingThread);
+    err = PltCreateThread("AudioPing", UdpPingThreadProc, NULL, &udpPingThread);
     if (err != 0) {
         AudioCallbacks.stop();
         PltInterruptThread(&receiveThread);
@@ -401,4 +399,8 @@ int startAudioStream(void* audioContext, int arFlags) {
     }
 
     return 0;
+}
+
+int LiGetPendingAudioFrames(void) {
+    return LbqGetItemCount(&packetQueue);
 }

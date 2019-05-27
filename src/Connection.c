@@ -20,6 +20,7 @@ int NegotiatedVideoFormat;
 volatile int ConnectionInterrupted;
 int HighQualitySurroundEnabled;
 int OriginalVideoBitrate;
+int AudioPacketDuration;
 
 // Connection stages
 static const char* stageNames[STAGE_MAX] = {
@@ -152,7 +153,7 @@ static void ClInternalConnectionTerminated(long errorCode)
     alreadyTerminated = 1;
 
     // Invoke the termination callback on a separate thread
-    err = PltCreateThread(terminationCallbackThreadFunc, NULL, &terminationCallbackThread);
+    err = PltCreateThread("AsyncTerm", terminationCallbackThreadFunc, NULL, &terminationCallbackThread);
     if (err != 0) {
         // Nothing we can safely do here, so we'll just assert on debug builds
         Limelog("Failed to create termination thread: %d\n", err);

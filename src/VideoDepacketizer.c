@@ -38,9 +38,7 @@ typedef struct _LENTRY_INTERNAL {
 
 // Init
 void initializeVideoDepacketizer(int pktSize) {
-    if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-        LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 15);
-    }
+    LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 15);
 
     nextFrameNumber = 1;
     startFrameNumber = 0;
@@ -116,17 +114,12 @@ static void freeDecodeUnitList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
 }
 
 void stopVideoDepacketizer(void) {
-    if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-        LbqSignalQueueShutdown(&decodeUnitQueue);
-    }
+    LbqSignalQueueShutdown(&decodeUnitQueue);
 }
 
 // Cleanup video depacketizer and free malloced memory
 void destroyVideoDepacketizer(void) {
-    if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-        freeDecodeUnitList(LbqDestroyLinkedBlockingQueue(&decodeUnitQueue));
-    }
-
+    freeDecodeUnitList(LbqDestroyLinkedBlockingQueue(&decodeUnitQueue));
     cleanupFrameState();
 }
 
@@ -486,9 +479,7 @@ void requestDecoderRefresh(void) {
     waitingForIdrFrame = 1;
     
     // Flush the decode unit queue
-    if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-        freeDecodeUnitList(LbqFlushQueueItems(&decodeUnitQueue));
-    }
+    freeDecodeUnitList(LbqFlushQueueItems(&decodeUnitQueue));
     
     // Request the receive thread drop its state
     // on the next call. We can't do it here because
@@ -583,17 +574,32 @@ void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length, unsigned long l
     lastPacketInStream = streamPacketIndex;
 
     // If this is the first packet, skip the frame header (if one exists)
-    if (firstPacket){
+    if (firstPacket) {
         if ((AppVersionQuad[0] > 7) ||
             (AppVersionQuad[0] == 7 && AppVersionQuad[1] > 1) ||
-            (AppVersionQuad[0] == 7 && AppVersionQuad[1] == 1 && AppVersionQuad[2] >= 350)) {
-            // >= 7.1.350 should use the 8 byte header again
+            (AppVersionQuad[0] == 7 && AppVersionQuad[1] == 1 && AppVersionQuad[2] >= 415)) {
+            // >= 7.1.415
+            // The first IDR frame now has smaller headers than the rest. We seem to be able to tell
+            // them apart by looking at the first byte. It will be 0x81 for the long header and 0x01
+            // for the short header.
+            // TODO: This algorithm seems to actually work on GFE 3.18 (first byte always 0x01), so
+            // maybe we could unify this codepath in the future.
+            if (currentPos.data[0] == 0x01) {
+                currentPos.offset += 8;
+                currentPos.length -= 8;
+            }
+            else {
+                LC_ASSERT(currentPos.data[0] == (char)0x81);
+                currentPos.offset += 24;
+                currentPos.length -= 24;
+            }
+        }
+        else if (AppVersionQuad[0] == 7 && AppVersionQuad[1] == 1 && AppVersionQuad[2] >= 350) {
+            // [7.1.350, 7.1.415) should use the 8 byte header again
             currentPos.offset += 8;
             currentPos.length -= 8;
         }
-        else if ((AppVersionQuad[0] > 7) ||
-            (AppVersionQuad[0] == 7 && AppVersionQuad[1] > 1) ||
-            (AppVersionQuad[0] == 7 && AppVersionQuad[1] == 1 && AppVersionQuad[2] >= 320)) {
+        else if (AppVersionQuad[0] == 7 && AppVersionQuad[1] == 1 && AppVersionQuad[2] >= 320) {
             // [7.1.320, 7.1.350) should use the 12 byte frame header
             currentPos.offset += 12;
             currentPos.length -= 12;
@@ -606,6 +612,12 @@ void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length, unsigned long l
         else {
             // Other versions don't have a frame header at all
         }
+
+        // Assert that the frame start NALU prefix is next
+        LC_ASSERT(currentPos.data[currentPos.offset + 0] == 0);
+        LC_ASSERT(currentPos.data[currentPos.offset + 1] == 0);
+        LC_ASSERT(currentPos.data[currentPos.offset + 2] == 0);
+        LC_ASSERT(currentPos.data[currentPos.offset + 3] == 1);
     }
 
     if (firstPacket && isIdrFrameStart(&currentPos))
@@ -666,30 +678,36 @@ void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length, unsigned long l
 }
 
 // Add an RTP Packet to the queue
-void queueRtpPacket(PRTPFEC_QUEUE_ENTRY queueEntry) {
+void queueRtpPacket(PRTPFEC_QUEUE_ENTRY queueEntryPtr) {
     int dataOffset;
+    RTPFEC_QUEUE_ENTRY queueEntry = *queueEntryPtr;
 
-    LC_ASSERT(!queueEntry->isParity);
-    LC_ASSERT(queueEntry->receiveTimeMs != 0);
+    LC_ASSERT(!queueEntry.isParity);
+    LC_ASSERT(queueEntry.receiveTimeMs != 0);
 
-    dataOffset = sizeof(*queueEntry->packet);
-    if (queueEntry->packet->header & FLAG_EXTENSION) {
+    dataOffset = sizeof(*queueEntry.packet);
+    if (queueEntry.packet->header & FLAG_EXTENSION) {
         dataOffset += 4; // 2 additional fields
     }
 
     // Reuse the memory reserved for the RTPFEC_QUEUE_ENTRY to store the LENTRY_INTERNAL
-    // now that we're in the depacketizer.
+    // now that we're in the depacketizer. We saved a copy of the real FEC queue entry
+    // on the stack here so we can safely modify this memory in place.
     LC_ASSERT(sizeof(LENTRY_INTERNAL) <= sizeof(RTPFEC_QUEUE_ENTRY));
-    PLENTRY_INTERNAL existingEntry = (PLENTRY_INTERNAL)queueEntry;
-    existingEntry->allocPtr = queueEntry->packet;
+    PLENTRY_INTERNAL existingEntry = (PLENTRY_INTERNAL)queueEntryPtr;
+    existingEntry->allocPtr = queueEntry.packet;
 
-    processRtpPayload((PNV_VIDEO_PACKET)(((char*)queueEntry->packet) + dataOffset),
-                      queueEntry->length - dataOffset,
-                      queueEntry->receiveTimeMs,
+    processRtpPayload((PNV_VIDEO_PACKET)(((char*)queueEntry.packet) + dataOffset),
+                      queueEntry.length - dataOffset,
+                      queueEntry.receiveTimeMs,
                       &existingEntry);
 
     if (existingEntry != NULL) {
         // processRtpPayload didn't want this packet, so just free it
         free(existingEntry->allocPtr);
     }
+}
+
+int LiGetPendingVideoFrames(void) {
+    return LbqGetItemCount(&decodeUnitQueue);
 }

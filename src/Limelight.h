@@ -228,6 +228,7 @@ typedef struct _OPUS_MULTISTREAM_CONFIGURATION {
     int channelCount;
     int streams;
     int coupledStreams;
+    int samplesPerFrame;
     unsigned char mapping[6];
 } OPUS_MULTISTREAM_CONFIGURATION, *POPUS_MULTISTREAM_CONFIGURATION;
 
@@ -442,6 +443,14 @@ uint64_t LiGetMillis(void);
 // address for streaming after GFE stopped sending it a while back. wanAddr is returned in
 // network byte order.
 int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, unsigned int* wanAddr);
+
+// Returns the number of queued video frames ready for delivery. Only relevant
+// if CAPABILITY_DIRECT_SUBMIT is not set for the video renderer.
+int LiGetPendingVideoFrames(void);
+
+// Returns the number of queued audio frames ready for delivery. Only relevant
+// if CAPABILITY_DIRECT_SUBMIT is not set for the audio renderer.
+int LiGetPendingAudioFrames(void);
 
 #ifdef __cplusplus
 }
