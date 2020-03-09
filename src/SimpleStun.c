@@ -1,5 +1,7 @@
 #include "Limelight-internal.h"
 
+#include <openssl/rand.h>
+
 #define STUN_RECV_TIMEOUT_SEC 3
 
 #define STUN_MESSAGE_BINDING_REQUEST 0x0001
@@ -24,12 +26,11 @@ typedef struct _STUN_MAPPED_IPV4_ADDRESS_ATTRIBUTE {
     unsigned int address;
 } STUN_MAPPED_IPV4_ADDRESS_ATTRIBUTE, *PSTUN_MAPPED_IPV4_ADDRESS_ATTRIBUTE;
 
-#define TXID_DWORDS 3
 typedef struct _STUN_MESSAGE {
     unsigned short messageType;
     unsigned short messageLength;
     unsigned int magicCookie;
-    int transactionId[TXID_DWORDS];
+    unsigned char transactionId[12];
 } STUN_MESSAGE, *PSTUN_MESSAGE;
 
 #pragma pack(pop)
@@ -38,9 +39,9 @@ typedef struct _STUN_MESSAGE {
 int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, unsigned int* wanAddr)
 {
     SOCKET sock;
-    struct sockaddr_storage stunAddr;
-    struct sockaddr_in* stunAddrIn;
-    SOCKADDR_LEN stunAddrLen;
+    struct addrinfo* stunAddrs;
+    struct addrinfo hints;
+    char stunPortStr[6];
     int err;
     STUN_MESSAGE reqMsg;
     int i;
@@ -58,13 +59,21 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
         return err;
     }
 
-    err = resolveHostName(stunServer, AF_INET, 0, &stunAddr, &stunAddrLen);
-    if (err != 0) {
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    hints.ai_flags = AI_ADDRCONFIG;
+
+    sprintf(stunPortStr, "%u", stunPort);
+    err = getaddrinfo(stunServer, stunPortStr, &hints, &stunAddrs);
+    if (err != 0 || stunAddrs == NULL) {
         Limelog("Failed to resolve STUN server: %d\n", err);
+        stunAddrs = NULL;
         goto Exit;
     }
 
-    sock = bindUdpSocket(AF_INET, 2048);
+    sock = bindUdpSocket(hints.ai_family, 2048);
     if (sock == INVALID_SOCKET) {
         err = LastSocketFail();
         Limelog("Failed to connect to STUN server: %d\n", err);
@@ -74,34 +83,32 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
     reqMsg.messageType = htons(STUN_MESSAGE_BINDING_REQUEST);
     reqMsg.messageLength = 0;
     reqMsg.magicCookie = htonl(STUN_MESSAGE_COOKIE);
-    for (i = 0; i < TXID_DWORDS; i++) {
-        reqMsg.transactionId[i] = rand();
-    }
+    RAND_bytes(reqMsg.transactionId, sizeof(reqMsg.transactionId));
 
     bytesRead = SOCKET_ERROR;
-    for (i = 0; i < STUN_RECV_TIMEOUT_SEC * 1000 / UDP_RECV_POLL_TIMEOUT_MS; i++) {
-        // Retransmit the request every second until the timeout elapses
+    for (i = 0; i < STUN_RECV_TIMEOUT_SEC * 1000 / UDP_RECV_POLL_TIMEOUT_MS && bytesRead <= 0; i++) {
+        // Retransmit the request every second until the timeout elapses or we get a response
         if (i % (1000 / UDP_RECV_POLL_TIMEOUT_MS) == 0) {
-            stunAddrIn = (struct sockaddr_in*)&stunAddr;
-            stunAddrIn->sin_port = htons(stunPort);
-            err = (int)sendto(sock, (char *)&reqMsg, sizeof(reqMsg), 0,
-                               (struct sockaddr*)stunAddrIn, stunAddrLen);
-            if (err == SOCKET_ERROR) {
-                err = LastSocketFail();
-                Limelog("Failed to send STUN binding request: %d\n", err);
-                closeSocket(sock);
-                goto Exit;
+            struct addrinfo *current;
+
+            // Send a request to each resolved address but stop if we get a response
+            for (current = stunAddrs; current != NULL && bytesRead <= 0; current = current->ai_next) {
+                err = (int)sendto(sock, (char *)&reqMsg, sizeof(reqMsg), 0, current->ai_addr, current->ai_addrlen);
+                if (err == SOCKET_ERROR) {
+                    err = LastSocketFail();
+                    Limelog("Failed to send STUN binding request: %d\n", err);
+                    continue;
+                }
+
+                // Wait UDP_RECV_POLL_TIMEOUT_MS before moving on to the next server to
+                // avoid having to spam the other STUN servers if we find a working one.
+                bytesRead = recvUdpSocket(sock, resp.buf, sizeof(resp.buf), 1);
             }
         }
-
-        // This waits in UDP_RECV_POLL_TIMEOUT_MS increments
-        bytesRead = recvUdpSocket(sock, resp.buf, sizeof(resp.buf), 1);
-        if (bytesRead == 0) {
-            // Timeout - continue looping
-            continue;
+        else {
+            // This waits in UDP_RECV_POLL_TIMEOUT_MS increments
+            bytesRead = recvUdpSocket(sock, resp.buf, sizeof(resp.buf), 1);
         }
-
-        break;
     }
 
     closeSocket(sock);
@@ -176,6 +183,10 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
     err = -6;
 
 Exit:
+    if (stunAddrs != NULL) {
+        freeaddrinfo(stunAddrs);
+    }
+
     cleanupPlatformSockets();
     return err;
 }

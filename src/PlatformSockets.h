@@ -13,21 +13,13 @@
 #define EWOULDBLOCK WSAEWOULDBLOCK
 #define EAGAIN WSAEWOULDBLOCK
 #define EINTR WSAEINTR
+#define ETIMEDOUT WSAETIMEDOUT
 
 typedef int SOCK_RET;
 typedef int SOCKADDR_LEN;
 
 #else
-#if defined(__vita__)
-#include <psp2/net/net.h>
-#include <enet/enet.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/select.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <errno.h>
-#else
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -37,7 +29,6 @@ typedef int SOCKADDR_LEN;
 #include <netdb.h>
 #include <errno.h>
 #include <signal.h>
-#endif
 
 #define ioctlsocket ioctl
 #define LastSocketError() errno
@@ -50,16 +41,6 @@ typedef ssize_t SOCK_RET;
 typedef socklen_t SOCKADDR_LEN;
 #endif
 
-#if defined(__vita__)
-#define TCP_NODELAY SCE_NET_TCP_NODELAY
-
-#define sockaddr_in6 sockaddr_in
-#define sin6_addr sin_addr
-#define sin6_port sin_port
-#define INET6_ADDRSTRLEN 128
-#define inet_ntop sceNetInetNtop
-#endif
-
 #define LastSocketFail() ((LastSocketError() != 0) ? LastSocketError() : -1)
 
 // IPv6 addresses have 2 extra characters for URL escaping
@@ -68,8 +49,10 @@ void addrToUrlSafeString(struct sockaddr_storage* addr, char* string);
 
 int resolveHostName(const char* host, int family, int tcpTestPort, struct sockaddr_storage* addr, SOCKADDR_LEN* addrLen);
 SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec);
+int sendMtuSafe(SOCKET s, char* buffer, int size);
 SOCKET bindUdpSocket(int addrfamily, int bufferSize);
 int enableNoDelay(SOCKET s);
+int setSocketNonBlocking(SOCKET s, int val);
 int recvUdpSocket(SOCKET s, char* buffer, int size, int useSelect);
 void shutdownTcpSocket(SOCKET s);
 int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs);

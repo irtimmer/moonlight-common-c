@@ -3,7 +3,7 @@
 
 #include <enet/enet.h>
 
-#define RTSP_MAX_RESP_SIZE 32768
+#define RTSP_MAX_RESP_SIZE 49152
 #define RTSP_TIMEOUT_SEC 10
 
 static int currentSeqNumber;
@@ -221,7 +221,6 @@ static int transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response,
         *error = LastSocketError();
         return ret;
     }
-    enableNoDelay(sock);
     setRecvTimeout(sock, RTSP_TIMEOUT_SEC);
 
     serializedMessage = serializeRtspMessage(request, &messageLen);
@@ -231,8 +230,10 @@ static int transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response,
         return ret;
     }
 
-    // Send our message
-    err = send(sock, serializedMessage, messageLen, 0);
+    // Send our message split into smaller chunks to avoid MTU issues.
+    // enableNoDelay() must have been called for sendMtuSafe() to work.
+    enableNoDelay(sock);
+    err = sendMtuSafe(sock, serializedMessage, messageLen);
     if (err == SOCKET_ERROR) {
         *error = LastSocketError();
         Limelog("Failed to send RTSP message: %d\n", *error);
@@ -243,11 +244,19 @@ static int transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response,
     offset = 0;
     for (;;) {
         err = recv(sock, &responseBuffer[offset], RTSP_MAX_RESP_SIZE - offset, 0);
-        if (err <= 0) {
+        if (err < 0) {
+            // Error reading
+            *error = LastSocketError();
+            Limelog("Failed to read RTSP response: %d\n", *error);
+            goto Exit;
+        }
+        else if (err == 0) {
             // Done reading
             break;
         }
-        offset += err;
+        else {
+            offset += err;
+        }
 
         // Warn if the RTSP message is too big
         if (offset == RTSP_MAX_RESP_SIZE) {
@@ -564,6 +573,15 @@ int performRtspHandshake(void) {
         }
         else {
             NegotiatedVideoFormat = VIDEO_FORMAT_H264;
+        }
+
+        // Check if high bitrate surround sound is available before attempting to request it.
+        // TODO: Parse these surround-params so we can get rid of our hardcoded Opus mappings
+        if (strstr(response.payload, "surround-params=660")) {
+            HighQualitySurroundSupported = 1;
+        }
+        else {
+            HighQualitySurroundSupported = 0;
         }
 
         freeMessage(&response);

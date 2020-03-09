@@ -5,7 +5,7 @@ static int stage = STAGE_NONE;
 static ConnListenerConnectionTerminated originalTerminationCallback;
 static int alreadyTerminated;
 static PLT_THREAD terminationCallbackThread;
-static long terminationCallbackErrorCode;
+static int terminationCallbackErrorCode;
 
 // Common globals
 char* RemoteAddrString;
@@ -18,6 +18,7 @@ DECODER_RENDERER_CALLBACKS VideoCallbacks;
 AUDIO_RENDERER_CALLBACKS AudioCallbacks;
 int NegotiatedVideoFormat;
 volatile int ConnectionInterrupted;
+int HighQualitySurroundSupported;
 int HighQualitySurroundEnabled;
 int OriginalVideoBitrate;
 int AudioPacketDuration;
@@ -140,7 +141,7 @@ static void terminationCallbackThreadFunc(void* context)
 // calls LiStopConnection() in the callback when the cleanup code
 // attempts to join the thread that the termination callback (and LiStopConnection)
 // is running on.
-static void ClInternalConnectionTerminated(long errorCode)
+static void ClInternalConnectionTerminated(int errorCode)
 {
     int err;
 

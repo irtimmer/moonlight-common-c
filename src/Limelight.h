@@ -18,6 +18,16 @@ extern "C" {
 #define STREAM_CFG_REMOTE  1
 #define STREAM_CFG_AUTO    2
 
+// Values for the 'colorSpace' field below.
+// Rec. 2020 is only supported with HEVC video streams.
+#define COLORSPACE_REC_601  0
+#define COLORSPACE_REC_709  1
+#define COLORSPACE_REC_2020 2
+
+// Values for the 'colorRange' field below
+#define COLOR_RANGE_LIMITED  0
+#define COLOR_RANGE_FULL     1
+
 typedef struct _STREAM_CONFIGURATION {
     // Dimensions in pixels of the desired video stream
     int width;
@@ -67,6 +77,14 @@ typedef struct _STREAM_CONFIGURATION {
     // 59.94 Hz would be specified as 5994. This is used by recent versions
     // of GFE for enhanced frame pacing.
     int clientRefreshRateX100;
+
+    // If specified, sets the encoder colorspace to the provided COLORSPACE_*
+    // option (listed above). If not set, the encoder will default to Rec 601.
+    int colorSpace;
+
+    // If specified, sets the encoder color range to the provided COLOR_RANGE_*
+    // option (listed above). If not set, the encoder will default to Limited.
+    int colorRange;
 
     // AES encryption data for the remote input stream. This must be
     // the same as what was passed as rikey and rikeyid
@@ -122,6 +140,11 @@ typedef struct _DECODE_UNIT {
     // shares the same epoch as this value.
     unsigned long long receiveTimeMs;
 
+    // Presentation time in milliseconds with the epoch at the first captured frame.
+    // This can be used to aid frame pacing or to drop old frames that were queued too
+    // long prior to display.
+    unsigned int presentationTimeMs;
+
     // Length of the entire buffer chain in bytes
     int fullLength;
 
@@ -170,6 +193,12 @@ typedef struct _DECODE_UNIT {
 // to never request the "high quality" audio preset. If unset, high quality audio will be
 // used with video streams above 15 Mbps.
 #define CAPABILITY_SLOW_OPUS_DECODER 0x8
+
+// If set in the audio renderer capabilities field, this indicates that audio packets
+// may contain more or less than 5 ms of audio. This requires that audio renderers read the
+// samplesPerFrame field in OPUS_MULTISTREAM_CONFIGURATION to calculate the correct decoded
+// buffer size rather than just assuming it will always be 240.
+#define CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION 0x10
 
 // If set in the video renderer capabilities field, this macro specifies that the renderer
 // supports slicing to increase decoding performance. The parameter specifies the desired
@@ -287,7 +316,7 @@ typedef void(*ConnListenerStageComplete)(int stage);
 // ConnListenerConnectionTerminated() will not be invoked because the connection was
 // not yet fully established. LiInterruptConnection() and LiStopConnection() may
 // result in this callback being invoked, but it is not guaranteed.
-typedef void(*ConnListenerStageFailed)(int stage, long errorCode);
+typedef void(*ConnListenerStageFailed)(int stage, int errorCode);
 
 // This callback is invoked after the connection is successfully established
 typedef void(*ConnListenerConnectionStarted)(void);
@@ -298,7 +327,7 @@ typedef void(*ConnListenerConnectionStarted)(void);
 // non-zero, it means the termination was probably unexpected (loss of network,
 // crash, or similar conditions). This will not be invoked as a result of a call
 // to LiStopConnection() or LiInterruptConnection().
-typedef void(*ConnListenerConnectionTerminated)(long errorCode);
+typedef void(*ConnListenerConnectionTerminated)(int errorCode);
 
 // This callback is invoked to log debug message
 typedef void(*ConnListenerLogMessage)(const char* format, ...);
@@ -323,8 +352,6 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageFailed stageFailed;
     ConnListenerConnectionStarted connectionStarted;
     ConnListenerConnectionTerminated connectionTerminated;
-    void* deprecated1; // was displayMessage()
-    void* deprecated2; // was displayTransientMessage()
     ConnListenerLogMessage logMessage;
     ConnListenerRumble rumble;
     ConnListenerConnectionStatusUpdate connectionStatusUpdate;
@@ -389,6 +416,7 @@ int LiSendMouseButtonEvent(char action, int button);
 #define MODIFIER_SHIFT 0x01
 #define MODIFIER_CTRL 0x02
 #define MODIFIER_ALT 0x04
+#define MODIFIER_META 0x08
 int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers);
 
 // Button flags
@@ -449,8 +477,14 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
 int LiGetPendingVideoFrames(void);
 
 // Returns the number of queued audio frames ready for delivery. Only relevant
-// if CAPABILITY_DIRECT_SUBMIT is not set for the audio renderer.
+// if CAPABILITY_DIRECT_SUBMIT is not set for the audio renderer. For most uses,
+// LiGetPendingAudioDuration() is probably a better option than this function.
 int LiGetPendingAudioFrames(void);
+
+// Similar to LiGetPendingAudioFrames() except it returns the pending audio in
+// milliseconds rather than frames, which allows callers to be agnostic of the
+// negotiated audio frame duration.
+int LiGetPendingAudioDuration(void);
 
 #ifdef __cplusplus
 }

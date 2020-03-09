@@ -466,7 +466,7 @@ static void controlReceiveThreadFunc(void* context) {
         return;
     }
 
-    long terminationErrorCode = -1;
+    int terminationErrorCode = -1;
 
     while (!PltIsThreadInterrupted(&controlReceiveThread)) {
         ENetEvent event;
@@ -501,7 +501,7 @@ static void controlReceiveThreadFunc(void* context) {
                         // assume the server died tragically, so go ahead and tear down.
                         PltUnlockMutex(&enetMutex);
                         Limelog("Disconnect event timeout expired\n");
-                        ListenerCallbacks.connectionTerminated(-1);
+                        ListenerCallbacks.connectionTerminated(terminationErrorCode);
                         return;
                     }
                 }
@@ -791,8 +791,7 @@ int startControlStream(void) {
         // Create a client that can use 1 outgoing connection and 1 channel
         client = enet_host_create(NULL, 1, 1, 0, 0);
         if (client == NULL) {
-            enet_host_destroy(client);
-            client = NULL;
+            stopping = 1;
             return -1;
         }
 
@@ -804,18 +803,22 @@ int startControlStream(void) {
         // Connect to the host
         peer = enet_host_connect(client, &address, 1, 0);
         if (peer == NULL) {
+            stopping = 1;
+            enet_host_destroy(client);
+            client = NULL;
             return -1;
         }
 
         // Wait for the connect to complete
         if (serviceEnetHost(client, &event, CONTROL_STREAM_TIMEOUT_SEC * 1000) <= 0 ||
             event.type != ENET_EVENT_TYPE_CONNECT) {
-            Limelog("RTSP: Failed to connect to UDP port 47999\n");
+            Limelog("Failed to connect to UDP port 47999\n");
+            stopping = 1;
             enet_peer_reset(peer);
             peer = NULL;
             enet_host_destroy(client);
             client = NULL;
-            return -1;
+            return ETIMEDOUT;
         }
 
         // Ensure the connect verify ACK is sent immediately
@@ -828,6 +831,7 @@ int startControlStream(void) {
         ctlSock = connectTcpSocket(&RemoteAddr, RemoteAddrLen,
             47995, CONTROL_STREAM_TIMEOUT_SEC);
         if (ctlSock == INVALID_SOCKET) {
+            stopping = 1;
             return LastSocketFail();
         }
 

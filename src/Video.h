@@ -5,7 +5,6 @@
 typedef struct _QUEUED_DECODE_UNIT {
     DECODE_UNIT decodeUnit;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
-    int onStack;
 } QUEUED_DECODE_UNIT, *PQUEUED_DECODE_UNIT;
 
 void completeQueuedDecodeUnit(PQUEUED_DECODE_UNIT qdu, int drStatus);
@@ -34,7 +33,8 @@ typedef struct _RTP_PACKET {
     char header;
     char packetType;
     unsigned short sequenceNumber;
-    char reserved[8];
+    unsigned int timestamp;
+    unsigned int ssrc;
 } RTP_PACKET, *PRTP_PACKET;
 
 #pragma pack(pop)

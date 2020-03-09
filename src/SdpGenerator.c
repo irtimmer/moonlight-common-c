@@ -252,14 +252,9 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     
     err |= addAttributeString(&optionHead, "x-nv-vqos[0].videoQualityScoreUpdateTime", "5000");
 
-    if (StreamConfig.streamingRemotely == STREAM_CFG_REMOTE) {
-        err |= addAttributeString(&optionHead, "x-nv-vqos[0].qosTrafficType", "0");
-        err |= addAttributeString(&optionHead, "x-nv-aqos.qosTrafficType", "0");
-    }
-    else {
-        err |= addAttributeString(&optionHead, "x-nv-vqos[0].qosTrafficType", "5");
-        err |= addAttributeString(&optionHead, "x-nv-aqos.qosTrafficType", "4");
-    }
+    // Enable DSCP marking to hopefully increase QoS priority
+    err |= addAttributeString(&optionHead, "x-nv-vqos[0].qosTrafficType", "5");
+    err |= addAttributeString(&optionHead, "x-nv-aqos.qosTrafficType", "4");
 
     if (AppVersionQuad[0] == 3) {
         err |= addGen3Options(&optionHead, urlSafeAddr);
@@ -269,6 +264,15 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     }
     else {
         err |= addGen5Options(&optionHead);
+    }
+
+    if (StreamConfig.audioConfiguration == AUDIO_CONFIGURATION_51_SURROUND) {
+        audioChannelCount = CHANNEL_COUNT_51_SURROUND;
+        audioChannelMask = CHANNEL_MASK_51_SURROUND;
+    }
+    else {
+        audioChannelCount = CHANNEL_COUNT_STEREO;
+        audioChannelMask = CHANNEL_MASK_STEREO;
     }
 
     if (AppVersionQuad[0] >= 4) {
@@ -337,15 +341,6 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
             sprintf(payloadStr, "%d", StreamConfig.clientRefreshRateX100);
             err |= addAttributeString(&optionHead, "x-nv-video[0].clientRefreshRateX100", payloadStr);
         }
-        
-        if (StreamConfig.audioConfiguration == AUDIO_CONFIGURATION_51_SURROUND) {
-            audioChannelCount = CHANNEL_COUNT_51_SURROUND;
-            audioChannelMask = CHANNEL_MASK_51_SURROUND;
-        }
-        else {
-            audioChannelCount = CHANNEL_COUNT_STEREO;
-            audioChannelMask = CHANNEL_MASK_STEREO;
-        }
 
         sprintf(payloadStr, "%d", audioChannelCount);
         err |= addAttributeString(&optionHead, "x-nv-audio.surround.numChannels", payloadStr);
@@ -357,42 +352,50 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         else {
             err |= addAttributeString(&optionHead, "x-nv-audio.surround.enable", "0");
         }
+    }
 
-        if (AppVersionQuad[0] >= 7) {
-            // Decide to use HQ audio based on the original video bitrate, not the HEVC-adjusted value
-            if (OriginalVideoBitrate >= HIGH_AUDIO_BITRATE_THRESHOLD && audioChannelCount > 2 &&
-                    (AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) == 0) {
-                // Enable high quality mode for surround sound
-                err |= addAttributeString(&optionHead, "x-nv-audio.surround.AudioQuality", "1");
+    if (AppVersionQuad[0] >= 7) {
+        // Decide to use HQ audio based on the original video bitrate, not the HEVC-adjusted value
+        if (OriginalVideoBitrate >= HIGH_AUDIO_BITRATE_THRESHOLD && audioChannelCount > 2 &&
+                HighQualitySurroundSupported && (AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) == 0) {
+            // Enable high quality mode for surround sound
+            err |= addAttributeString(&optionHead, "x-nv-audio.surround.AudioQuality", "1");
 
-                // Let the audio stream code know that it needs to disable coupled streams when
-                // decoding this audio stream.
-                HighQualitySurroundEnabled = 1;
+            // Let the audio stream code know that it needs to disable coupled streams when
+            // decoding this audio stream.
+            HighQualitySurroundEnabled = 1;
 
-                // Use 5 ms frames since we don't have a slow decoder
-                AudioPacketDuration = 5;
-            }
-            else {
-                err |= addAttributeString(&optionHead, "x-nv-audio.surround.AudioQuality", "0");
-                HighQualitySurroundEnabled = 0;
-
-                if ((AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) == 0) {
-                    // Use 5 ms packets by default for lowest latency
-                    AudioPacketDuration = 5;
-                }
-                else {
-                    // Use 20 ms packets for slow decoders to save CPU and bandwidth
-                    AudioPacketDuration = 20;
-                }
-            }
-
-            sprintf(payloadStr, "%d", AudioPacketDuration);
-            err |= addAttributeString(&optionHead, "x-nv-aqos.packetDuration", payloadStr);
-        }
-        else {
-            // 5 ms duration for legacy servers
+            // Use 5 ms frames since we don't have a slow decoder
             AudioPacketDuration = 5;
         }
+        else {
+            err |= addAttributeString(&optionHead, "x-nv-audio.surround.AudioQuality", "0");
+            HighQualitySurroundEnabled = 0;
+
+            if ((AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) != 0 ||
+                ((AudioCallbacks.capabilities & CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION) != 0 &&
+                    OriginalVideoBitrate < LOW_AUDIO_BITRATE_TRESHOLD)) {
+                // Use 20 ms packets for slow decoders and networks to save CPU and bandwidth
+                AudioPacketDuration = 20;
+            }
+            else {
+
+                // Use 5 ms packets by default for lowest latency
+                AudioPacketDuration = 5;
+            }
+        }
+
+        sprintf(payloadStr, "%d", AudioPacketDuration);
+        err |= addAttributeString(&optionHead, "x-nv-aqos.packetDuration", payloadStr);
+    }
+    else {
+        // 5 ms duration for legacy servers
+        AudioPacketDuration = 5;
+    }
+
+    if (AppVersionQuad[0] >= 7) {
+        sprintf(payloadStr, "%d", (StreamConfig.colorSpace << 1) | StreamConfig.colorRange);
+        err |= addAttributeString(&optionHead, "x-nv-video[0].encoderCscMode", payloadStr);
     }
 
     if (err == 0) {
