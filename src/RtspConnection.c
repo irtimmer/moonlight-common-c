@@ -19,6 +19,16 @@ static SOCKET sock = INVALID_SOCKET;
 static ENetHost* client;
 static ENetPeer* peer;
 
+#define CHAR_TO_INT(x) ((x) - '0')
+#define CHAR_IS_DIGIT(x) ((x) >= '0' && (x) <= '9')
+
+#define SWAP_CHANNEL(config, i, j) \
+{ \
+    unsigned char tmp = (config)->mapping[i]; \
+    (config)->mapping[i] = (config)->mapping[j]; \
+    (config)->mapping[j] = tmp; \
+}
+
 // Create RTSP Option
 static POPTION_ITEM createOptionItem(char* option, char* content)
 {
@@ -435,6 +445,141 @@ static int sendVideoAnnounce(PRTSP_MESSAGE response, int* error) {
     return ret;
 }
 
+static int parseOpusConfigFromParamString(char* paramStr, int channelCount, POPUS_MULTISTREAM_CONFIGURATION opusConfig) {
+    int i;
+
+    // Set channel count (included in the prefix, so not parsed below)
+    opusConfig->channelCount = channelCount;
+
+    // Parse the remaining data from the surround-params value
+    if (!CHAR_IS_DIGIT(*paramStr)) {
+        Limelog("Invalid stream count: %c\n", *paramStr);
+        return -1;
+    }
+    opusConfig->streams = CHAR_TO_INT(*paramStr);
+    paramStr++;
+
+    if (!CHAR_IS_DIGIT(*paramStr)) {
+        Limelog("Invalid coupled stream count: %c\n", *paramStr);
+        return -2;
+    }
+    opusConfig->coupledStreams = CHAR_TO_INT(*paramStr);
+    paramStr++;
+
+    for (i = 0; i < opusConfig->channelCount; i++) {
+        if (!CHAR_IS_DIGIT(*paramStr)) {
+            Limelog("Invalid mapping value at %d: %c\n", i, *paramStr);
+            return -3;
+        }
+
+        opusConfig->mapping[i] = CHAR_TO_INT(*paramStr);
+        paramStr++;
+    }
+
+    return 0;
+}
+
+// Parses the Opus configuration from an RTSP DESCRIBE response
+static int parseOpusConfigurations(PRTSP_MESSAGE response) {
+    HighQualitySurroundSupported = 0;
+    memset(&NormalQualityOpusConfig, 0, sizeof(NormalQualityOpusConfig));
+    memset(&HighQualityOpusConfig, 0, sizeof(HighQualityOpusConfig));
+
+    // Sample rate is always 48 KHz
+    HighQualityOpusConfig.sampleRate = NormalQualityOpusConfig.sampleRate = 48000;
+
+    // Stereo doesn't have any surround-params elements in the RTSP data
+    if (CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration) == 2) {
+        NormalQualityOpusConfig.channelCount = 2;
+        NormalQualityOpusConfig.streams = 1;
+        NormalQualityOpusConfig.coupledStreams = 1;
+        NormalQualityOpusConfig.mapping[0] = 0;
+        NormalQualityOpusConfig.mapping[1] = 1;
+    }
+    else {
+        char paramsPrefix[128];
+        char* paramStart;
+        int err;
+        int channelCount;
+
+        channelCount = CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration);
+
+        // Find the correct audio parameter value
+        sprintf(paramsPrefix, "a=fmtp:97 surround-params=%d", channelCount);
+        paramStart = strstr(response->payload, paramsPrefix);
+        if (paramStart) {
+            // Skip the prefix
+            paramStart += strlen(paramsPrefix);
+
+            // Parse the normal quality Opus config
+            err = parseOpusConfigFromParamString(paramStart, channelCount, &NormalQualityOpusConfig);
+            if (err != 0) {
+                return err;
+            }
+
+            // GFE's normal-quality channel mapping differs from the one our clients use.
+            // They use FL FR C RL RR SL SR LFE, but we use FL FR C LFE RL RR SL SR. We'll need
+            // to swap the mappings to match the expected values.
+            if (channelCount == 6 || channelCount == 8) {
+                OPUS_MULTISTREAM_CONFIGURATION originalMapping = NormalQualityOpusConfig;
+
+                // LFE comes after C
+                NormalQualityOpusConfig.mapping[3] = originalMapping.mapping[channelCount - 1];
+
+                // Slide everything else up
+                memcpy(&NormalQualityOpusConfig.mapping[4],
+                       &originalMapping.mapping[3],
+                       channelCount - 4);
+            }
+
+            // If this configuration is compatible with high quality mode, we may have another
+            // matching surround-params value for high quality mode.
+            paramStart = strstr(paramStart, paramsPrefix);
+            if (paramStart) {
+                // Skip the prefix
+                paramStart += strlen(paramsPrefix);
+
+                // Parse the high quality Opus config
+                err = parseOpusConfigFromParamString(paramStart, channelCount, &HighQualityOpusConfig);
+                if (err != 0) {
+                    return err;
+                }
+
+                // We can request high quality audio
+                HighQualitySurroundSupported = 1;
+            }
+        }
+        else {
+            Limelog("No surround parameters found for channel count: %d\n", channelCount);
+
+            // It's unknown whether all GFE versions that supported surround sound included these
+            // surround sound parameters. In case they didn't, we'll specifically handle 5.1 surround
+            // sound using a hardcoded configuration like we used to before this parsing code existed.
+            //
+            // It is not necessary to provide HighQualityOpusConfig here because high quality mode
+            // can only be enabled from seeing the required "surround-params=" value, so there's no
+            // chance it could regress from implementing this parser.
+            if (channelCount == 6) {
+                NormalQualityOpusConfig.channelCount = 6;
+                NormalQualityOpusConfig.streams = 4;
+                NormalQualityOpusConfig.coupledStreams = 2;
+                NormalQualityOpusConfig.mapping[0] = 0;
+                NormalQualityOpusConfig.mapping[1] = 4;
+                NormalQualityOpusConfig.mapping[2] = 1;
+                NormalQualityOpusConfig.mapping[3] = 5;
+                NormalQualityOpusConfig.mapping[4] = 2;
+                NormalQualityOpusConfig.mapping[5] = 3;
+            }
+            else {
+                // We don't have a hardcoded fallback mapping, so we have no choice but to fail.
+                return -4;
+            }
+        }
+    }
+
+    return 0;
+}
+
 // Perform RTSP Handshake with the streaming server machine as part of the connection process
 int performRtspHandshake(void) {
     int ret;
@@ -573,15 +718,17 @@ int performRtspHandshake(void) {
         }
         else {
             NegotiatedVideoFormat = VIDEO_FORMAT_H264;
+
+            // Dimensions over 4096 are only supported with HEVC on NVENC
+            if (StreamConfig.width > 4096 || StreamConfig.height > 4096) {
+                Limelog("WARNING: Host PC doesn't support HEVC. Streaming at resolutions above 4K using H.264 will likely fail!\n");
+            }
         }
 
-        // Check if high bitrate surround sound is available before attempting to request it.
-        // TODO: Parse these surround-params so we can get rid of our hardcoded Opus mappings
-        if (strstr(response.payload, "surround-params=660")) {
-            HighQualitySurroundSupported = 1;
-        }
-        else {
-            HighQualitySurroundSupported = 0;
+        // Parse the Opus surround parameters out of the RTSP DESCRIBE response.
+        ret = parseOpusConfigurations(&response);
+        if (ret != 0) {
+            goto Exit;
         }
 
         freeMessage(&response);

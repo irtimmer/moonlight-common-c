@@ -466,12 +466,10 @@ static void controlReceiveThreadFunc(void* context) {
         return;
     }
 
-    int terminationErrorCode = -1;
-
     while (!PltIsThreadInterrupted(&controlReceiveThread)) {
         ENetEvent event;
 
-        // Poll every 100 ms for new packets
+        // Poll for new packets and process retransmissions
         PltLockMutex(&enetMutex);
         err = serviceEnetHost(client, &event, 0);
         PltUnlockMutex(&enetMutex);
@@ -501,7 +499,7 @@ static void controlReceiveThreadFunc(void* context) {
                         // assume the server died tragically, so go ahead and tear down.
                         PltUnlockMutex(&enetMutex);
                         Limelog("Disconnect event timeout expired\n");
-                        ListenerCallbacks.connectionTerminated(terminationErrorCode);
+                        ListenerCallbacks.connectionTerminated(-1);
                         return;
                     }
                 }
@@ -510,8 +508,12 @@ static void controlReceiveThreadFunc(void* context) {
                 }
             }
             else {
-                // No events ready
-                PltSleepMsInterruptible(&controlReceiveThread, 100);
+                // No events ready - sleep for a short time
+                //
+                // NOTE: This sleep *directly* impacts the lowest possible retransmission
+                // time for packets after a loss event. If we're busy sleeping here, we can't
+                // retransmit a dropped packet, so we keep the sleep time to a minimum.
+                PltSleepMsInterruptible(&controlReceiveThread, 10);
                 continue;
             }
         }
@@ -553,6 +555,7 @@ static void controlReceiveThreadFunc(void* context) {
                 BbInitializeWrappedBuffer(&bb, (char*)event.packet->data, sizeof(*ctlHdr), event.packet->dataLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
 
                 unsigned short terminationReason;
+                int terminationErrorCode;
 
                 BbGetShort(&bb, (short*)&terminationReason);
 
@@ -568,15 +571,21 @@ static void controlReceiveThreadFunc(void* context) {
                     terminationErrorCode = terminationReason;
                 }
 
-                // We don't actually notify the connection listener until we receive
-                // the disconnect event from the server that confirms the termination.
+                // We used to wait for a ENET_EVENT_TYPE_DISCONNECT event, but since
+                // GFE 3.20.3.63 we don't get one for 10 seconds after we first get
+                // this termination message. The termination message should be reliable
+                // enough to end the stream now, rather than waiting for an explicit
+                // disconnect.
+                ListenerCallbacks.connectionTerminated(terminationErrorCode);
+                enet_packet_destroy(event.packet);
+                return;
             }
 
             enet_packet_destroy(event.packet);
         }
         else if (event.type == ENET_EVENT_TYPE_DISCONNECT) {
-            Limelog("Control stream received disconnect event\n");
-            ListenerCallbacks.connectionTerminated(terminationErrorCode);
+            Limelog("Control stream received unexpected disconnect event\n");
+            ListenerCallbacks.connectionTerminated(-1);
             return;
         }
     }

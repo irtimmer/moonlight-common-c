@@ -52,7 +52,7 @@ typedef struct _STREAM_CONFIGURATION {
     int streamingRemotely;
 
     // Specifies the channel configuration of the audio stream.
-    // See AUDIO_CONFIGURATION_XXX constants below.
+    // See AUDIO_CONFIGURATION constants and MAKE_AUDIO_CONFIGURATION() below.
     int audioConfiguration;
     
     // Specifies that the client can accept an H.265 video stream
@@ -153,10 +153,31 @@ typedef struct _DECODE_UNIT {
 } DECODE_UNIT, *PDECODE_UNIT;
 
 // Specifies that the audio stream should be encoded in stereo (default)
-#define AUDIO_CONFIGURATION_STEREO 0
+#define AUDIO_CONFIGURATION_STEREO MAKE_AUDIO_CONFIGURATION(2, 0x3)
 
 // Specifies that the audio stream should be in 5.1 surround sound if the PC is able
-#define AUDIO_CONFIGURATION_51_SURROUND 1
+#define AUDIO_CONFIGURATION_51_SURROUND MAKE_AUDIO_CONFIGURATION(6, 0x3F)
+
+// Specifies that the audio stream should be in 7.1 surround sound if the PC is able
+#define AUDIO_CONFIGURATION_71_SURROUND MAKE_AUDIO_CONFIGURATION(8, 0x63F)
+
+// Specifies an audio configuration by channel count and channel mask
+// See https://docs.microsoft.com/en-us/windows-hardware/drivers/audio/channel-mask for channelMask values
+// NOTE: Not all combinations are supported by GFE and/or this library.
+#define MAKE_AUDIO_CONFIGURATION(channelCount, channelMask) \
+    (((channelMask) << 16) | (channelCount << 8) | 0xCA)
+
+// Helper macros for retreiving channel count and channel mask from the audio configuration
+#define CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(x) (((x) >> 8) & 0xFF)
+#define CHANNEL_MASK_FROM_AUDIO_CONFIGURATION(x) (((x) >> 16) & 0xFFFF)
+
+// Helper macro to retreive the surroundAudioInfo parameter value that must be passed in
+// the /launch and /resume HTTPS requests when starting the session.
+#define SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(x) \
+    (CHANNEL_MASK_FROM_AUDIO_CONFIGURATION(x) << 16 | CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(x))
+
+// The maximum number of channels supported
+#define AUDIO_CONFIGURATION_MAX_CHANNEL_COUNT 8
 
 // Passed to DecoderRendererSetup to indicate that the following video stream will be
 // in H.264 High Profile.
@@ -247,8 +268,10 @@ void LiInitializeVideoCallbacks(PDECODER_RENDERER_CALLBACKS drCallbacks);
 // 1 - Front Right
 // 2 - Center
 // 3 - LFE
-// 4 - Surround Left
-// 5 - Surround Right
+// 4 - Back Left
+// 5 - Back Right
+// 6 - Side Left
+// 7 - Side Right
 //
 // If the mapping order does not match the channel order of the audio renderer, you may swap
 // the values in the mismatched indices until the mapping array matches the desired channel order.
@@ -258,7 +281,7 @@ typedef struct _OPUS_MULTISTREAM_CONFIGURATION {
     int streams;
     int coupledStreams;
     int samplesPerFrame;
-    unsigned char mapping[6];
+    unsigned char mapping[AUDIO_CONFIGURATION_MAX_CHANNEL_COUNT];
 } OPUS_MULTISTREAM_CONFIGURATION, *POPUS_MULTISTREAM_CONFIGURATION;
 
 // This callback initializes the audio renderer. The audio configuration parameter
@@ -397,8 +420,22 @@ void LiInterruptConnection(void);
 // from the integer passed to the ConnListenerStageXXX callbacks
 const char* LiGetStageName(int stage);
 
-// This function queues a mouse move event to be sent to the remote server.
+// This function queues a relative mouse move event to be sent to the remote server.
 int LiSendMouseMoveEvent(short deltaX, short deltaY);
+
+// This function queues a mouse position update event to be sent to the remote server.
+//
+// Absolute mouse motion doesn't work in many games, so this mode should not be the default
+// for mice when streaming. It may be desirable as the default touchscreen behavior if the
+// touchscreen is not the primary input method.
+//
+// The x and y values are transformed to host coordinates as if they are from a plane which
+// is referenceWidth by referenceHeight in size. This allows you to provide coordinates that
+// are relative to an arbitrary plane, such as a window, screen, or scaled video view.
+//
+// For example, if you wanted to directly pass window coordinates as x and y, you would set
+// referenceWidth and referenceHeight to your window width and height.
+int LiSendMousePositionEvent(short x, short y, short referenceWidth, short referenceHeight);
 
 // This function queues a mouse button event to be sent to the remote server.
 #define BUTTON_ACTION_PRESS 0x07

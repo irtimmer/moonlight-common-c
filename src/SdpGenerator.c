@@ -5,12 +5,6 @@
 #define MAX_SDP_HEADER_LEN 128
 #define MAX_SDP_TAIL_LEN 128
 
-#define CHANNEL_COUNT_STEREO 2
-#define CHANNEL_COUNT_51_SURROUND 6
-
-#define CHANNEL_MASK_STEREO 0x3
-#define CHANNEL_MASK_51_SURROUND 0xFC
-
 typedef struct _SDP_OPTION {
     char name[MAX_OPTION_NAME_LEN + 1];
     void* payload;
@@ -266,14 +260,8 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         err |= addGen5Options(&optionHead);
     }
 
-    if (StreamConfig.audioConfiguration == AUDIO_CONFIGURATION_51_SURROUND) {
-        audioChannelCount = CHANNEL_COUNT_51_SURROUND;
-        audioChannelMask = CHANNEL_MASK_51_SURROUND;
-    }
-    else {
-        audioChannelCount = CHANNEL_COUNT_STEREO;
-        audioChannelMask = CHANNEL_MASK_STEREO;
-    }
+    audioChannelCount = CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration);
+    audioChannelMask = CHANNEL_MASK_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration);
 
     if (AppVersionQuad[0] >= 4) {
         unsigned char slicesPerFrame;
@@ -372,14 +360,16 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
             err |= addAttributeString(&optionHead, "x-nv-audio.surround.AudioQuality", "0");
             HighQualitySurroundEnabled = 0;
 
-            if ((AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) != 0 ||
-                ((AudioCallbacks.capabilities & CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION) != 0 &&
-                    OriginalVideoBitrate < LOW_AUDIO_BITRATE_TRESHOLD)) {
-                // Use 20 ms packets for slow decoders and networks to save CPU and bandwidth
+            if ((AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) != 0) {
+                // Use 20 ms packets for slow decoders to save CPU time
                 AudioPacketDuration = 20;
             }
+            else if ((AudioCallbacks.capabilities & CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION) != 0 &&
+                      OriginalVideoBitrate < LOW_AUDIO_BITRATE_TRESHOLD) {
+                // Use 10 ms packets for slow networks to balance latency and bandwidth usage
+                AudioPacketDuration = 10;
+            }
             else {
-
                 // Use 5 ms packets by default for lowest latency
                 AudioPacketDuration = 5;
             }
@@ -391,6 +381,9 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     else {
         // 5 ms duration for legacy servers
         AudioPacketDuration = 5;
+
+        // High quality audio mode not supported on legacy servers
+        HighQualitySurroundEnabled = 0;
     }
 
     if (AppVersionQuad[0] >= 7) {

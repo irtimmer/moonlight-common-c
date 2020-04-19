@@ -20,6 +20,8 @@ int NegotiatedVideoFormat;
 volatile int ConnectionInterrupted;
 int HighQualitySurroundSupported;
 int HighQualitySurroundEnabled;
+OPUS_MULTISTREAM_CONFIGURATION NormalQualityOpusConfig;
+OPUS_MULTISTREAM_CONFIGURATION HighQualityOpusConfig;
 int OriginalVideoBitrate;
 int AudioPacketDuration;
 
@@ -171,11 +173,32 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     void* audioContext, int arFlags) {
     int err;
 
+    // Replace missing callbacks with placeholders
+    fixupMissingCallbacks(&drCallbacks, &arCallbacks, &clCallbacks);
+    memcpy(&VideoCallbacks, drCallbacks, sizeof(VideoCallbacks));
+    memcpy(&AudioCallbacks, arCallbacks, sizeof(AudioCallbacks));
+
+    // Hook the termination callback so we can avoid issuing a termination callback
+    // after LiStopConnection() is called.
+    //
+    // Initialize ListenerCallbacks before anything that could call Limelog().
+    originalTerminationCallback = clCallbacks->connectionTerminated;
+    memcpy(&ListenerCallbacks, clCallbacks, sizeof(ListenerCallbacks));
+    ListenerCallbacks.connectionTerminated = ClInternalConnectionTerminated;
+
     NegotiatedVideoFormat = 0;
     memcpy(&StreamConfig, streamConfig, sizeof(StreamConfig));
     OriginalVideoBitrate = streamConfig->bitrate;
     RemoteAddrString = strdup(serverInfo->address);
     
+    // Validate the audio configuration
+    if (MAGIC_BYTE_FROM_AUDIO_CONFIG(StreamConfig.audioConfiguration) != 0xCA ||
+            CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration) > AUDIO_CONFIGURATION_MAX_CHANNEL_COUNT) {
+        Limelog("Invalid audio configuration specified\n");
+        err = -1;
+        goto Cleanup;
+    }
+
     // FEC only works in 16 byte chunks, so we must round down
     // the given packet size to the nearest multiple of 16.
     StreamConfig.packetSize -= StreamConfig.packetSize % 16;
@@ -185,6 +208,24 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
         err = -1;
         goto Cleanup;
     }
+
+    // Height must not be odd or NVENC will fail to initialize
+    if (StreamConfig.height & 0x1) {
+        Limelog("Encoder height must not be odd. Rounding %d to %d\n",
+                StreamConfig.height,
+                StreamConfig.height & ~0x1);
+        StreamConfig.height = StreamConfig.height & ~0x1;
+    }
+
+    // Dimensions over 4096 are only supported with HEVC on NVENC
+    if (!StreamConfig.supportsHevc &&
+            (StreamConfig.width > 4096 || StreamConfig.height > 4096)) {
+        Limelog("WARNING: Streaming at resolutions above 4K using H.264 will likely fail! Trying anyway!\n");
+    }
+    // Dimensions over 8192 aren't supported at all (even on Turing)
+    else if (StreamConfig.width > 8192 || StreamConfig.height > 8192) {
+        Limelog("WARNING: Streaming at resolutions above 8K will likely fail! Trying anyway!\n");
+    }
     
     // Extract the appversion from the supplied string
     if (extractVersionQuadFromString(serverInfo->serverInfoAppVersion,
@@ -193,17 +234,6 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
         err = -1;
         goto Cleanup;
     }
-
-    // Replace missing callbacks with placeholders
-    fixupMissingCallbacks(&drCallbacks, &arCallbacks, &clCallbacks);
-    memcpy(&VideoCallbacks, drCallbacks, sizeof(VideoCallbacks));
-    memcpy(&AudioCallbacks, arCallbacks, sizeof(AudioCallbacks));
-
-    // Hook the termination callback so we can avoid issuing a termination callback
-    // after LiStopConnection() is called
-    originalTerminationCallback = clCallbacks->connectionTerminated;
-    memcpy(&ListenerCallbacks, clCallbacks, sizeof(ListenerCallbacks));
-    ListenerCallbacks.connectionTerminated = ClInternalConnectionTerminated;
 
     alreadyTerminated = 0;
     ConnectionInterrupted = 0;
