@@ -2,6 +2,13 @@
 #include "RtpFecQueue.h"
 #include "rs.h"
 
+#ifdef LC_DEBUG
+// This enables FEC validation mode with a synthetic drop
+// and recovered packet checks vs the original input. It
+// is on by default for debug builds.
+#define FEC_VALIDATION_MODE
+#endif
+
 void RtpfInitializeQueue(PRTP_FEC_QUEUE queue) {
     reed_solomon_init();
     memset(queue, 0, sizeof(*queue));
@@ -18,7 +25,7 @@ void RtpfCleanupQueue(PRTP_FEC_QUEUE queue) {
 }
 
 // newEntry is contained within the packet buffer so we free the whole entry by freeing entry->packet
-static int queuePacket(PRTP_FEC_QUEUE queue, PRTPFEC_QUEUE_ENTRY newEntry, int head, PRTP_PACKET packet, int length, int isParity) {
+static bool queuePacket(PRTP_FEC_QUEUE queue, PRTPFEC_QUEUE_ENTRY newEntry, bool head, PRTP_PACKET packet, int length, bool isParity) {
     PRTPFEC_QUEUE_ENTRY entry;
     
     LC_ASSERT(!isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber));
@@ -34,7 +41,7 @@ static int queuePacket(PRTP_FEC_QUEUE queue, PRTPFEC_QUEUE_ENTRY newEntry, int h
         entry = queue->bufferHead;
         while (entry != NULL) {
             if (entry->packet->sequenceNumber == packet->sequenceNumber) {
-                return 0;
+                return false;
             }
 
             entry = entry->next;
@@ -72,7 +79,7 @@ static int queuePacket(PRTP_FEC_QUEUE queue, PRTPFEC_QUEUE_ENTRY newEntry, int h
     }
     queue->bufferSize++;
 
-    return 1;
+    return true;
 }
 
 #define PACKET_RECOVERY_FAILURE()                     \
@@ -85,22 +92,42 @@ static int queuePacket(PRTP_FEC_QUEUE queue, PRTPFEC_QUEUE_ENTRY newEntry, int h
 
 // Returns 0 if the frame is completely constructed
 static int reconstructFrame(PRTP_FEC_QUEUE queue) {
-    int totalPackets = U16(queue->bufferHighestSequenceNumber - queue->bufferLowestSequenceNumber) + 1;
+    unsigned int totalPackets = U16(queue->bufferHighestSequenceNumber - queue->bufferLowestSequenceNumber) + 1;
     int ret;
     
+#ifdef FEC_VALIDATION_MODE
+    // We'll need an extra packet to run in FEC validation mode, because we will
+    // be "dropping" one below and recovering it using parity. However, some frames
+    // are so large that FEC is disabled entirely, so don't wait for parity on those.
+    if (queue->bufferSize < queue->bufferDataPackets + (queue->fecPercentage ? 1 : 0)) {
+#else
     if (queue->bufferSize < queue->bufferDataPackets) {
+#endif
         // Not enough data to recover yet
         return -1;
     }
     
+#ifdef FEC_VALIDATION_MODE
+    // If FEC is disabled or unsupported for this frame, we must bail early here.
+    if ((queue->fecPercentage == 0 || AppVersionQuad[0] < 5) &&
+            queue->receivedBufferDataPackets == queue->bufferDataPackets) {
+#else
     if (queue->receivedBufferDataPackets == queue->bufferDataPackets) {
+#endif
         // We've received a full frame with no need for FEC.
         return 0;
     }
 
+    if (AppVersionQuad[0] < 5) {
+        // Our FEC recovery code doesn't work properly until Gen 5
+        Limelog("FEC recovery not supported on Gen %d servers\n",
+                AppVersionQuad[0]);
+        return -1;
+    }
+
     reed_solomon* rs = NULL;
-    unsigned char** packets = malloc(totalPackets * sizeof(unsigned char*));
-    unsigned char* marks = malloc(totalPackets * sizeof(unsigned char));
+    unsigned char** packets = calloc(totalPackets, sizeof(unsigned char*));
+    unsigned char* marks = calloc(totalPackets, sizeof(unsigned char));
     if (packets == NULL || marks == NULL) {
         ret = -2;
         goto cleanup;
@@ -121,9 +148,28 @@ static int reconstructFrame(PRTP_FEC_QUEUE queue) {
     int receiveSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
     int packetBufferSize = receiveSize + sizeof(RTPFEC_QUEUE_ENTRY);
 
+#ifdef FEC_VALIDATION_MODE
+    // Choose a packet to drop
+    unsigned int dropIndex = rand() % queue->bufferDataPackets;
+    PRTP_PACKET droppedRtpPacket = NULL;
+    int droppedRtpPacketLength = 0;
+#endif
+
     PRTPFEC_QUEUE_ENTRY entry = queue->bufferHead;
     while (entry != NULL) {
-        int index = U16(entry->packet->sequenceNumber - queue->bufferLowestSequenceNumber);
+        unsigned int index = U16(entry->packet->sequenceNumber - queue->bufferLowestSequenceNumber);
+
+#ifdef FEC_VALIDATION_MODE
+        if (index == dropIndex) {
+            // If this was the drop choice, remember the original contents
+            // and "drop" it.
+            droppedRtpPacket = entry->packet;
+            droppedRtpPacketLength = entry->length;
+            entry = entry->next;
+            continue;
+        }
+#endif
+
         packets[index] = (unsigned char*) entry->packet;
         marks[index] = 0;
         
@@ -135,7 +181,7 @@ static int reconstructFrame(PRTP_FEC_QUEUE queue) {
         entry = entry->next;
     }
 
-    int i;
+    unsigned int i;
     for (i = 0; i < totalPackets; i++) {
         if (marks[i]) {
             packets[i] = malloc(packetBufferSize);
@@ -172,6 +218,59 @@ cleanup_packets:
                 PNV_VIDEO_PACKET nvPacket = (PNV_VIDEO_PACKET)(((char*)rtpPacket) + dataOffset);
                 nvPacket->frameIndex = queue->currentFrameNumber;
 
+#ifdef FEC_VALIDATION_MODE
+                if (i == dropIndex && droppedRtpPacket != NULL) {
+                    // Check the packet contents if this was our known drop
+                    PNV_VIDEO_PACKET droppedNvPacket = (PNV_VIDEO_PACKET)(((char*)droppedRtpPacket) + dataOffset);
+                    int droppedDataLength = droppedRtpPacketLength - dataOffset - sizeof(*nvPacket);
+                    int recoveredDataLength = StreamConfig.packetSize - sizeof(*nvPacket);
+                    int j;
+                    int recoveryErrors = 0;
+
+                    LC_ASSERT(droppedDataLength <= recoveredDataLength);
+                    LC_ASSERT(droppedDataLength == recoveredDataLength || (nvPacket->flags & FLAG_EOF));
+
+                    // Check all NV_VIDEO_PACKET fields except fecInfo which differs in the recovered packet
+                    LC_ASSERT(nvPacket->flags == droppedNvPacket->flags);
+                    LC_ASSERT(nvPacket->frameIndex == droppedNvPacket->frameIndex);
+                    LC_ASSERT(nvPacket->streamPacketIndex == droppedNvPacket->streamPacketIndex);
+
+                    // TODO: Investigate assertion failure here with GFE 3.20.4. The remaining fields and
+                    // video data are still recovered successfully, so this doesn't seem critical.
+                    //LC_ASSERT(memcmp(nvPacket->reserved, droppedNvPacket->reserved, sizeof(nvPacket->reserved)) == 0);
+
+                    // Check the data itself - use memcmp() and only loop if an error is detected
+                    if (memcmp(nvPacket + 1, droppedNvPacket + 1, droppedDataLength)) {
+                        unsigned char* actualData = (unsigned char*)(nvPacket + 1);
+                        unsigned char* expectedData = (unsigned char*)(droppedNvPacket + 1);
+                        for (j = 0; j < droppedDataLength; j++) {
+                            if (actualData[j] != expectedData[j]) {
+                                Limelog("Recovery error at %d: expected 0x%02x, actual 0x%02x\n",
+                                        j, expectedData[j], actualData[j]);
+                                recoveryErrors++;
+                            }
+                        }
+                    }
+
+                    // If this packet is at the end of the frame, the remaining data should be zeros.
+                    for (j = droppedDataLength; j < recoveredDataLength; j++) {
+                        unsigned char* actualData = (unsigned char*)(nvPacket + 1);
+                        if (actualData[j] != 0) {
+                            Limelog("Recovery error at %d: expected 0x00, actual 0x%02x\n",
+                                    j, actualData[j]);
+                            recoveryErrors++;
+                        }
+                    }
+
+                    LC_ASSERT(recoveryErrors == 0);
+
+                    // This drop was fake, so we don't want to actually submit it to the depacketizer.
+                    // It will get confused because it's already seen this packet before.
+                    free(packets[i]);
+                    continue;
+                }
+#endif
+
                 // Do some rudamentary checks to see that the recovered packet is sane.
                 // In some cases (4K 30 FPS 80 Mbps), we seem to get some odd failures
                 // here in rare cases where FEC recovery is required. I'm unsure if it
@@ -196,7 +295,7 @@ cleanup_packets:
                 // it may be a legitimate part of the H.264 bytestream.
 
                 LC_ASSERT(isBefore16(rtpPacket->sequenceNumber, queue->bufferFirstParitySequenceNumber));
-                queuePacket(queue, queueEntry, 0, rtpPacket, StreamConfig.packetSize + dataOffset, 0);
+                queuePacket(queue, queueEntry, false, rtpPacket, StreamConfig.packetSize + dataOffset, false);
             } else if (packets[i] != NULL) {
                 free(packets[i]);
             }
@@ -305,6 +404,9 @@ int RtpfAddPacket(PRTP_FEC_QUEUE queue, PRTP_PACKET packet, int length, PRTPFEC_
         return RTPF_RET_REJECTED;
     }
 
+    // FLAG_EXTENSION is required for all supported versions of GFE.
+    LC_ASSERT(packet->header & FLAG_EXTENSION);
+
     int dataOffset = sizeof(*packet);
     if (packet->header & FLAG_EXTENSION) {
         dataOffset += 4; // 2 additional fields
@@ -331,7 +433,11 @@ int RtpfAddPacket(PRTP_FEC_QUEUE queue, PRTP_PACKET packet, int length, PRTPFEC_
         }
         
         queue->currentFrameNumber = nvPacket->frameIndex;
-        
+
+        // Tell the control stream logic about this frame, even if we don't end up
+        // being able to reconstruct a full frame from it.
+        connectionSawFrame(queue->currentFrameNumber);
+
         // Discard any unsubmitted buffers from the previous frame
         while (queue->bufferHead != NULL) {
             PRTPFEC_QUEUE_ENTRY entry = queue->bufferHead;
@@ -361,7 +467,8 @@ int RtpfAddPacket(PRTP_FEC_QUEUE queue, PRTP_PACKET packet, int length, PRTPFEC_
     LC_ASSERT((nvPacket->fecInfo & 0xFF0) >> 4 == queue->fecPercentage);
     LC_ASSERT((nvPacket->fecInfo & 0xFFC00000) >> 22 == queue->bufferDataPackets);
 
-    if (!queuePacket(queue, packetEntry, 0, packet, length, !isBefore16(packet->sequenceNumber, queue->bufferFirstParitySequenceNumber))) {
+    LC_ASSERT((nvPacket->flags & FLAG_EOF) || length - dataOffset == StreamConfig.packetSize);
+    if (!queuePacket(queue, packetEntry, false, packet, length, !isBefore16(packet->sequenceNumber, queue->bufferFirstParitySequenceNumber))) {
         return RTPF_RET_REJECTED;
     }
     else {

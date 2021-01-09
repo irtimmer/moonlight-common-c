@@ -20,7 +20,9 @@ static PLT_THREAD udpPingThread;
 static PLT_THREAD receiveThread;
 static PLT_THREAD decoderThread;
 
-static int receivedDataFromPeer;
+static bool receivedDataFromPeer;
+static uint64_t firstDataTimeMs;
+static bool receivedFullFrame;
 
 // We can't request an IDR frame until the depacketizer knows
 // that a packet was lost. This timeout bounds the time that
@@ -32,7 +34,9 @@ static int receivedDataFromPeer;
 void initializeVideoStream(void) {
     initializeVideoDepacketizer(StreamConfig.packetSize);
     RtpfInitializeQueue(&rtpQueue); //TODO RTP_QUEUE_DELAY
-    receivedDataFromPeer = 0;
+    receivedDataFromPeer = false;
+    firstDataTimeMs = 0;
+    receivedFullFrame = false;
 }
 
 // Clean up the video stream
@@ -58,13 +62,7 @@ static void UdpPingThreadProc(void* context) {
             return;
         }
 
-        // Send less frequently if we've received data from our peer
-        if (receivedDataFromPeer) {
-            PltSleepMsInterruptible(&udpPingThread, 5000);
-        }
-        else {
-            PltSleepMsInterruptible(&udpPingThread, 500);
-        }
+        PltSleepMsInterruptible(&udpPingThread, 500);
     }
 }
 
@@ -74,7 +72,8 @@ static void ReceiveThreadProc(void* context) {
     int bufferSize, receiveSize;
     char* buffer;
     int queueStatus;
-    int useSelect;
+    bool useSelect;
+    int waitingForVideoMs;
 
     receiveSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
     bufferSize = receiveSize + sizeof(RTPFEC_QUEUE_ENTRY);
@@ -82,13 +81,14 @@ static void ReceiveThreadProc(void* context) {
 
     if (setNonFatalRecvTimeoutMs(rtpSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
         // SO_RCVTIMEO failed, so use select() to wait
-        useSelect = 1;
+        useSelect = true;
     }
     else {
         // SO_RCVTIMEO timeout set for recv()
-        useSelect = 0;
+        useSelect = false;
     }
 
+    waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
 
@@ -108,13 +108,37 @@ static void ReceiveThreadProc(void* context) {
             break;
         }
         else if  (err == 0) {
+            if (!receivedDataFromPeer) {
+                // If we wait many seconds without ever receiving a video packet,
+                // assume something is broken and terminate the connection.
+                waitingForVideoMs += UDP_RECV_POLL_TIMEOUT_MS;
+                if (waitingForVideoMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
+                    Limelog("Terminating connection due to lack of video traffic\n");
+                    ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_TRAFFIC);
+                    break;
+                }
+            }
+            
             // Receive timed out; try again
             continue;
         }
 
-        // We've received data, so we can stop sending our ping packets
-        // as quickly, since we're now just keeping the NAT session open.
-        receivedDataFromPeer = 1;
+        if (!receivedDataFromPeer) {
+            receivedDataFromPeer = true;
+            Limelog("Received first video packet after %d ms\n", waitingForVideoMs);
+
+            firstDataTimeMs = PltGetMillis();
+        }
+
+        if (!receivedFullFrame) {
+            uint64_t now = PltGetMillis();
+
+            if (now - firstDataTimeMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
+                Limelog("Terminating connection due to lack of a successful video frame\n");
+                ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_FRAME);
+                break;
+            }
+        }
 
         // Convert fields to host byte-order
         packet = (PRTP_PACKET)&buffer[0];
@@ -135,6 +159,15 @@ static void ReceiveThreadProc(void* context) {
     }
 }
 
+void submitFrame(PQUEUED_DECODE_UNIT qdu) {
+    // Pass the frame to the decoder
+    int ret = VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit);
+    completeQueuedDecodeUnit(qdu, ret);
+
+    // Remember that we got a full frame successfully
+    receivedFullFrame = true;
+}
+
 // Decoder thread proc
 static void DecoderThreadProc(void* context) {
     PQUEUED_DECODE_UNIT qdu;
@@ -143,9 +176,7 @@ static void DecoderThreadProc(void* context) {
             return;
         }
 
-        int ret = VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit);
-
-        completeQueuedDecodeUnit(qdu, ret);
+        submitFrame(qdu);
     }
 }
 
@@ -162,6 +193,10 @@ int readFirstFrame(void) {
 
 // Terminate the video stream
 void stopVideoStream(void) {
+    if (!receivedDataFromPeer) {
+        Limelog("No video traffic was ever received from the host!\n");
+    }
+
     VideoCallbacks.stop();
 
     // Wake up client code that may be waiting on the decode unit queue

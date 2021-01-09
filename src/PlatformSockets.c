@@ -9,6 +9,18 @@
 #define TCPv4_MSS 536
 #define TCPv6_MSS 1220
 
+#if defined(LC_WINDOWS)
+static HMODULE WlanApiLibraryHandle;
+static HANDLE WlanHandle;
+
+DWORD (WINAPI *pfnWlanOpenHandle)(DWORD dwClientVersion, PVOID pReserved, PDWORD pdwNegotiatedVersion, PHANDLE phClientHandle);
+DWORD (WINAPI *pfnWlanCloseHandle)(HANDLE hClientHandle, PVOID pReserved);
+DWORD (WINAPI *pfnWlanEnumInterfaces)(HANDLE hClientHandle, PVOID pReserved, PWLAN_INTERFACE_INFO_LIST *ppInterfaceList);
+VOID (WINAPI *pfnWlanFreeMemory)(PVOID pMemory);
+DWORD (WINAPI *pfnWlanSetInterface)(HANDLE hClientHandle, CONST GUID *pInterfaceGuid, WLAN_INTF_OPCODE OpCode, DWORD dwDataSize, CONST PVOID pData, PVOID pReserved);
+
+#endif
+
 void addrToUrlSafeString(struct sockaddr_storage* addr, char* string)
 {
     char addrstr[INET6_ADDRSTRLEN];
@@ -65,43 +77,119 @@ void setRecvTimeout(SOCKET s, int timeoutSec) {
     }
 }
 
-int recvUdpSocket(SOCKET s, char* buffer, int size, int useSelect) {
-    fd_set readfds;
-    int err;
+int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
+#if defined(LC_WINDOWS) || defined(__vita__)
+    // We could have used WSAPoll() but it has some nasty bugs
+    // https://daniel.haxx.se/blog/2012/10/10/wsapoll-is-broken/
+    //
+    // We'll emulate WSAPoll() with select(). Fortunately, Microsoft's definition
+    // of fd_set does not have the same stack corruption hazards that UNIX does.
+    fd_set readFds, writeFds, exceptFds;
+    int i, err, nfds;
     struct timeval tv;
-    
-    if (useSelect) {
-        FD_ZERO(&readfds);
-        FD_SET(s, &readfds);
 
-        // Wait up to 100 ms for the socket to be readable
-        tv.tv_sec = 0;
-        tv.tv_usec = UDP_RECV_POLL_TIMEOUT_MS * 1000;
+    FD_ZERO(&readFds);
+    FD_ZERO(&writeFds);
+    FD_ZERO(&exceptFds);
 
-        err = select((int)(s) + 1, &readfds, NULL, NULL, &tv);
-        if (err <= 0) {
-            // Return if an error or timeout occurs
-            return err;
+    nfds = 0;
+    for (i = 0; i < pollFdsCount; i++) {
+        // Clear revents on input like poll() does
+        pollFds[i].revents = 0;
+
+        if (pollFds[i].events & POLLIN) {
+            FD_SET(pollFds[i].fd, &readFds);
+        }
+        if (pollFds[i].events & POLLOUT) {
+            FD_SET(pollFds[i].fd, &writeFds);
+
+#ifdef LC_WINDOWS
+            // Windows signals failed connections as an exception,
+            // while Linux signals them as writeable.
+            FD_SET(pollFds[i].fd, &exceptFds);
+#endif
         }
 
-        // This won't block since the socket is readable
-        return (int)recv(s, buffer, size, 0);
+#ifndef LC_WINDOWS
+        // nfds is unused on Windows
+        if (pollFds[i].fd >= nfds) {
+            nfds = pollFds[i].fd + 1;
+        }
+#endif
     }
-    else {
-        // The caller has already configured a timeout on this
-        // socket via SO_RCVTIMEO, so we can avoid a syscall
-        // for each packet.
-        err = (int)recv(s, buffer, size, 0);
-        if (err < 0 &&
-                (LastSocketError() == EWOULDBLOCK ||
-                 LastSocketError() == EINTR ||
-                 LastSocketError() == EAGAIN)) {
-            // Return 0 for timeout
-            return 0;
-        }
 
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+
+    err = select(nfds, &readFds, &writeFds, &exceptFds, timeoutMs >= 0 ? &tv : NULL);
+    if (err <= 0) {
+        // Error or timeout
         return err;
     }
+
+    for (i = 0; i < pollFdsCount; i++) {
+        if (FD_ISSET(pollFds[i].fd, &readFds)) {
+            pollFds[i].revents |= POLLRDNORM;
+        }
+
+        if (FD_ISSET(pollFds[i].fd, &writeFds)) {
+            pollFds[i].revents |= POLLWRNORM;
+        }
+
+        if (FD_ISSET(pollFds[i].fd, &exceptFds)) {
+            pollFds[i].revents |= POLLERR;
+        }
+    }
+
+    return err;
+#else
+    return poll(pollFds, pollFdsCount, timeoutMs);
+#endif
+}
+
+int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
+    int err;
+    
+    do {
+        if (useSelect) {
+            struct pollfd pfd;
+
+            // Wait up to 100 ms for the socket to be readable
+            pfd.fd = s;
+            pfd.events = POLLIN;
+            err = pollSockets(&pfd, 1, UDP_RECV_POLL_TIMEOUT_MS);
+            if (err <= 0) {
+                // Return if an error or timeout occurs
+                return err;
+            }
+
+            // This won't block since the socket is readable
+            err = (int)recvfrom(s, buffer, size, 0, NULL, NULL);
+        }
+        else {
+            // The caller has already configured a timeout on this
+            // socket via SO_RCVTIMEO, so we can avoid a syscall
+            // for each packet.
+            err = (int)recvfrom(s, buffer, size, 0, NULL, NULL);
+            if (err < 0 &&
+                    (LastSocketError() == EWOULDBLOCK ||
+                     LastSocketError() == EINTR ||
+                     LastSocketError() == EAGAIN)) {
+                // Return 0 for timeout
+                return 0;
+            }
+        }
+
+    // We may receive an error due to a previous ICMP Port Unreachable error received
+    // by this socket. We want to ignore those and continue reading. If the remote party
+    // is really dead, ENet or TCP connection failures will trigger connection teardown.
+#if defined(LC_WINDOWS)
+    } while (err < 0 && LastSocketError() == WSAECONNRESET);
+#else
+    } while (err < 0 && LastSocketError() == ECONNREFUSED);
+#endif
+
+    return err;
 }
 
 void closeSocket(SOCKET s) {
@@ -119,9 +207,8 @@ SOCKET bindUdpSocket(int addrfamily, int bufferSize) {
 
     LC_ASSERT(addrfamily == AF_INET || addrfamily == AF_INET6);
 
-    s = socket(addrfamily, SOCK_DGRAM, IPPROTO_UDP);
+    s = createSocket(addrfamily, SOCK_DGRAM, IPPROTO_UDP, false);
     if (s == INVALID_SOCKET) {
-        Limelog("socket() failed: %d\n", (int)LastSocketError());
         return INVALID_SOCKET;
     }
 
@@ -180,7 +267,8 @@ SOCKET bindUdpSocket(int addrfamily, int bufferSize) {
     return s;
 }
 
-int setSocketNonBlocking(SOCKET s, int val) {
+int setSocketNonBlocking(SOCKET s, bool enabled) {
+    int val = enabled ? 1 : 0;
 #if defined(__vita__)
     return setsockopt(s, SOL_SOCKET, SO_NONBLOCK, (char*)&val, sizeof(val));
 #elif defined(FIONBIO)
@@ -190,24 +278,42 @@ int setSocketNonBlocking(SOCKET s, int val) {
 #endif
 }
 
-SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec) {
+SOCKET createSocket(int addressFamily, int socketType, int protocol, bool nonBlocking) {
     SOCKET s;
-    struct sockaddr_in6 addr;
-    int err;
-    int nonBlocking;
-    int val;
 
-    s = socket(dstaddr->ss_family, SOCK_STREAM, IPPROTO_TCP);
+    s = socket(addressFamily, socketType, protocol);
     if (s == INVALID_SOCKET) {
         Limelog("socket() failed: %d\n", (int)LastSocketError());
         return INVALID_SOCKET;
     }
-    
+
 #ifdef LC_DARWIN
-    // Disable SIGPIPE on iOS
-    val = 1;
-    setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (char*)&val, sizeof(val));
+    {
+        // Disable SIGPIPE on iOS
+        int val = 1;
+        setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (char*)&val, sizeof(val));
+    }
 #endif
+
+    if (nonBlocking) {
+        setSocketNonBlocking(s, true);
+    }
+
+    return s;
+}
+
+SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec) {
+    SOCKET s;
+    struct sockaddr_in6 addr;
+    struct pollfd pfd;
+    int err;
+    int val;
+
+    // Create a non-blocking TCP socket
+    s = createSocket(dstaddr->ss_family, SOCK_STREAM, IPPROTO_TCP, true);
+    if (s == INVALID_SOCKET) {
+        return INVALID_SOCKET;
+    }
 
     // Some broken routers/firewalls (or routes with multiple broken routers) may result in TCP packets
     // being dropped without without us receiving an ICMP Fragmentation Needed packet. For example,
@@ -250,9 +356,6 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
         Limelog("setsockopt(TCP_MAXSEG, %d) failed: %d\n", val, (int)LastSocketError());
     }
 #endif
-    
-    // Enable non-blocking I/O for connect timeout support
-    nonBlocking = setSocketNonBlocking(s, 1) == 0;
 
     // Start connection
     memcpy(&addr, dstaddr, addrlen);
@@ -260,51 +363,44 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
     err = connect(s, (struct sockaddr*) &addr, addrlen);
     if (err < 0) {
         err = (int)LastSocketError();
+        if (err != EWOULDBLOCK && err != EAGAIN && err != EINPROGRESS) {
+            goto Exit;
+        }
     }
     
-    if (nonBlocking) {
-        fd_set writefds, exceptfds;
-        struct timeval tv;
-        
-        FD_ZERO(&writefds);
-        FD_ZERO(&exceptfds);
-        FD_SET(s, &writefds);
-        FD_SET(s, &exceptfds);
-        
-        tv.tv_sec = timeoutSec;
-        tv.tv_usec = 0;
-        
-        // Wait for the connection to complete or the timeout to elapse
-        err = select(s + 1, NULL, &writefds, &exceptfds, &tv);
-        if (err < 0) {
-            // select() failed
-            err = LastSocketError();
-            Limelog("select() failed: %d\n", err);
-            closeSocket(s);
-            SetLastSocketError(err);
-            return INVALID_SOCKET;
-        }
-        else if (err == 0) {
-            // select() timed out
-            Limelog("select() timed out after %d seconds\n", timeoutSec);
-            closeSocket(s);
-            SetLastSocketError(ETIMEDOUT);
-            return INVALID_SOCKET;
-        }
-        else if (FD_ISSET(s, &writefds) || FD_ISSET(s, &exceptfds)) {
-            // The socket was signalled
-            SOCKADDR_LEN len = sizeof(err);
-            getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
-            if (err != 0 || FD_ISSET(s, &exceptfds)) {
-                // Get the error code
-                err = (err != 0) ? err : LastSocketFail();
-            }
-        }
-        
-        // Disable non-blocking I/O now that the connection is established
-        setSocketNonBlocking(s, 0);
+    // Wait for the connection to complete or the timeout to elapse
+    pfd.fd = s;
+    pfd.events = POLLOUT;
+    err = pollSockets(&pfd, 1, timeoutSec * 1000);
+    if (err < 0) {
+        // pollSockets() failed
+        err = LastSocketError();
+        Limelog("pollSockets() failed: %d\n", err);
+        closeSocket(s);
+        SetLastSocketError(err);
+        return INVALID_SOCKET;
     }
+    else if (err == 0) {
+        // pollSockets() timed out
+        Limelog("Connection timed out after %d seconds (TCP port %u)\n", timeoutSec, port);
+        closeSocket(s);
+        SetLastSocketError(ETIMEDOUT);
+        return INVALID_SOCKET;
+    }
+    else {
+        // The socket was signalled
+        SOCKADDR_LEN len = sizeof(err);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
+        if (err != 0 || (pfd.revents & POLLERR)) {
+            // Get the error code
+            err = (err != 0) ? err : LastSocketFail();
+        }
+    }
+
+    // Disable non-blocking I/O now that the connection is established
+    setSocketNonBlocking(s, false);
     
+Exit:
     if (err != 0) {
         Limelog("connect() failed: %d\n", err);
         closeSocket(s);
@@ -368,12 +464,13 @@ int resolveHostName(const char* host, int family, int tcpTestPort, struct sockad
     }
     
     for (currentAddr = res; currentAddr != NULL; currentAddr = currentAddr->ai_next) {
-        // Use the test port to ensure this address is working if there
-        // are multiple addresses for this host name
-        if (tcpTestPort != 0 && res->ai_next != NULL) {
+        // Use the test port to ensure this address is working if:
+        // a) We have multiple addresses
+        // b) The caller asked us to test even with a single address
+        if (tcpTestPort != 0 && (res->ai_next != NULL || (tcpTestPort & TCP_PORT_FLAG_ALWAYS_TEST))) {
             SOCKET testSocket = connectTcpSocket((struct sockaddr_storage*)currentAddr->ai_addr,
                                                  currentAddr->ai_addrlen,
-                                                 tcpTestPort,
+                                                 tcpTestPort & TCP_PORT_MASK,
                                                  TEST_PORT_TIMEOUT_SEC);
             if (testSocket == INVALID_SOCKET) {
                 // Try the next address
@@ -396,20 +493,20 @@ int resolveHostName(const char* host, int family, int tcpTestPort, struct sockad
     return -1;
 }
 
-int isInSubnetV6(struct sockaddr_in6* sin6, unsigned char* subnet, int prefixLength) {
+bool isInSubnetV6(struct sockaddr_in6* sin6, unsigned char* subnet, int prefixLength) {
     int i;
     
     for (i = 0; i < prefixLength; i++) {
         unsigned char mask = 1 << (i % 8);
         if ((sin6->sin6_addr.s6_addr[i / 8] & mask) != (subnet[i / 8] & mask)) {
-            return 0;
+            return false;
         }
     }
     
-    return 1;
+    return true;
 }
 
-int isPrivateNetworkAddress(struct sockaddr_storage* address) {
+bool isPrivateNetworkAddress(struct sockaddr_storage* address) {
 
     // We only count IPv4 addresses as possibly private for now
     if (address->ss_family == AF_INET) {
@@ -420,19 +517,19 @@ int isPrivateNetworkAddress(struct sockaddr_storage* address) {
         
         // 10.0.0.0/8
         if ((addr & 0xFF000000) == 0x0A000000) {
-            return 1;
+            return true;
         }
         // 172.16.0.0/12
         else if ((addr & 0xFFF00000) == 0xAC100000) {
-            return 1;
+            return true;
         }
         // 192.168.0.0/16
         else if ((addr & 0xFFFF0000) == 0xC0A80000) {
-            return 1;
+            return true;
         }
         // 169.254.0.0/16
         else if ((addr & 0xFFFF0000) == 0xA9FE0000) {
-            return 1;
+            return true;
         }
     }
     else if (address->ss_family == AF_INET6) {
@@ -443,19 +540,120 @@ int isPrivateNetworkAddress(struct sockaddr_storage* address) {
 
         // fe80::/10
         if (isInSubnetV6(sin6, linkLocalPrefix, 10)) {
-            return 1;
+            return true;
         }
         // fec0::/10
         else if (isInSubnetV6(sin6, siteLocalPrefix, 10)) {
-            return 1;
+            return true;
         }
         // fc00::/7
         else if (isInSubnetV6(sin6, uniqueLocalPrefix, 7)) {
-            return 1;
+            return true;
         }
     }
 
-    return 0;
+    return false;
+}
+
+// Enable platform-specific low latency options (best-effort)
+void enterLowLatencyMode(void) {
+#if defined(LC_WINDOWS)
+    DWORD negotiatedVersion;
+    PWLAN_INTERFACE_INFO_LIST wlanInterfaceList;
+    DWORD i;
+
+    // Reduce timer period to increase wait precision
+    timeBeginPeriod(1);
+
+    // Load wlanapi.dll dynamically because it will not always be present on Windows Server SKUs.
+    WlanApiLibraryHandle = LoadLibraryA("wlanapi.dll");
+    if (WlanApiLibraryHandle == NULL) {
+        Limelog("WLANAPI is not supported on this OS\n");
+        return;
+    }
+
+    pfnWlanOpenHandle = GetProcAddress(WlanApiLibraryHandle, "WlanOpenHandle");
+    pfnWlanCloseHandle = GetProcAddress(WlanApiLibraryHandle, "WlanCloseHandle");
+    pfnWlanFreeMemory = GetProcAddress(WlanApiLibraryHandle, "WlanFreeMemory");
+    pfnWlanEnumInterfaces = GetProcAddress(WlanApiLibraryHandle, "WlanEnumInterfaces");
+    pfnWlanSetInterface = GetProcAddress(WlanApiLibraryHandle, "WlanSetInterface");
+
+    if (pfnWlanOpenHandle == NULL || pfnWlanCloseHandle == NULL ||
+            pfnWlanFreeMemory == NULL || pfnWlanEnumInterfaces == NULL || pfnWlanSetInterface == NULL) {
+        LC_ASSERT(pfnWlanOpenHandle != NULL);
+        LC_ASSERT(pfnWlanCloseHandle != NULL);
+        LC_ASSERT(pfnWlanFreeMemory != NULL);
+        LC_ASSERT(pfnWlanEnumInterfaces != NULL);
+        LC_ASSERT(pfnWlanSetInterface != NULL);
+
+        // This should never happen since that would mean Microsoft removed a public API, but
+        // we'll check and fail gracefully just in case.
+        FreeLibrary(WlanApiLibraryHandle);
+        WlanApiLibraryHandle = NULL;
+        return;
+    }
+
+    // Use the Vista+ WLAN API version
+    LC_ASSERT(WlanHandle == NULL);
+    if (pfnWlanOpenHandle(WLAN_API_MAKE_VERSION(2, 0), NULL, &negotiatedVersion, &WlanHandle) != ERROR_SUCCESS) {
+        WlanHandle = NULL;
+        return;
+    }
+
+    if (pfnWlanEnumInterfaces(WlanHandle, NULL, &wlanInterfaceList) != ERROR_SUCCESS) {
+        pfnWlanCloseHandle(WlanHandle, NULL);
+        WlanHandle = NULL;
+        return;
+    }
+
+    for (i = 0; i < wlanInterfaceList->dwNumberOfItems; i++) {
+        if (wlanInterfaceList->InterfaceInfo[i].isState == wlan_interface_state_connected) {
+            DWORD error;
+            BOOL value;
+
+            // Enable media streaming mode for 802.11 wireless interfaces to reduce latency and
+            // unneccessary background scanning operations that cause packet loss and jitter.
+            //
+            // https://docs.microsoft.com/en-us/windows-hardware/drivers/network/oid-wdi-set-connection-quality
+            // https://docs.microsoft.com/en-us/previous-versions/windows/hardware/wireless/native-802-11-media-streaming
+            value = TRUE;
+            error = pfnWlanSetInterface(WlanHandle, &wlanInterfaceList->InterfaceInfo[i].InterfaceGuid,
+                                        wlan_intf_opcode_media_streaming_mode, sizeof(value), &value, NULL);
+            if (error == ERROR_SUCCESS) {
+                Limelog("WLAN interface %d is now in low latency mode\n", i);
+            }
+        }
+    }
+
+    pfnWlanFreeMemory(wlanInterfaceList);
+#else
+#endif
+}
+
+void exitLowLatencyMode(void) {
+#if defined(LC_WINDOWS)
+    // Closing our WLAN client handle will undo our optimizations
+    if (WlanHandle != NULL) {
+        pfnWlanCloseHandle(WlanHandle, NULL);
+        WlanHandle = NULL;
+    }
+
+    // Release the library reference to wlanapi.dll
+    if (WlanApiLibraryHandle != NULL) {
+        pfnWlanOpenHandle = NULL;
+        pfnWlanCloseHandle = NULL;
+        pfnWlanFreeMemory = NULL;
+        pfnWlanEnumInterfaces = NULL;
+        pfnWlanSetInterface = NULL;
+
+        FreeLibrary(WlanApiLibraryHandle);
+        WlanApiLibraryHandle = NULL;
+    }
+
+    // Restore original timer period
+    timeEndPeriod(1);
+#else
+#endif
 }
 
 int initializePlatformSockets(void) {

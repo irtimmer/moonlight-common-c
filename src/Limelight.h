@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -135,10 +136,16 @@ typedef struct _DECODE_UNIT {
     // Frame type
     int frameType;
 
-    // Receive time of first buffer. This value uses an implementation-defined epoch.
-    // To compute actual latency values, use LiGetMillis() to get a timestamp that
-    // shares the same epoch as this value.
-    unsigned long long receiveTimeMs;
+    // Receive time of first buffer. This value uses an implementation-defined epoch,
+    // but the same epoch as enqueueTimeMs and LiGetMillis().
+    uint64_t receiveTimeMs;
+
+    // Time the frame was fully assembled and queued for the video decoder to process.
+    // This is also approximately the same time as the final packet was received, so
+    // enqueueTimeMs - receiveTimeMs is the time taken to receive the frame. At the
+    // time the decode unit is passed to submitDecodeUnit(), the total queue delay
+    // can be calculated by LiGetMillis() - enqueueTimeMs.
+    uint64_t enqueueTimeMs;
 
     // Presentation time in milliseconds with the epoch at the first captured frame.
     // This can be used to aid frame pacing or to drop old frames that were queued too
@@ -352,6 +359,28 @@ typedef void(*ConnListenerConnectionStarted)(void);
 // to LiStopConnection() or LiInterruptConnection().
 typedef void(*ConnListenerConnectionTerminated)(int errorCode);
 
+// This error code is passed to ConnListenerConnectionTerminated() when the stream
+// is being gracefully terminated by the host. It usually means the app on the host
+// PC has exited.
+#define ML_ERROR_GRACEFUL_TERMINATION 0
+
+// This error is passed to ConnListenerConnectionTerminated() if no video data
+// was ever received for this connection after waiting several seconds. It likely
+// indicates a problem with traffic on UDP 47998 due to missing or incorrect
+// firewall or port forwarding rules.
+#define ML_ERROR_NO_VIDEO_TRAFFIC -100
+
+// This error is passed to ConnListenerConnectionTerminated() if a fully formed
+// frame could not be received after waiting several seconds. It likely indicates
+// an extremely unstable connection or a bitrate that is far too high.
+#define ML_ERROR_NO_VIDEO_FRAME -101
+
+// This error is passed to ConnListenerConnectionTerminated() if the stream ends
+// very soon after starting due to a graceful termination from the host. Usually
+// this seems to happen if DRM protected content is on-screen, or another issue
+// that prevents the encoder from being able to capture video successfully.
+#define ML_ERROR_UNEXPECTED_EARLY_TERMINATION -102
+
 // This callback is invoked to log debug message
 typedef void(*ConnListenerLogMessage)(const char* format, ...);
 
@@ -424,6 +453,8 @@ const char* LiGetStageName(int stage);
 int LiSendMouseMoveEvent(short deltaX, short deltaY);
 
 // This function queues a mouse position update event to be sent to the remote server.
+// This functionality is only reliably supported on GFE 3.20 or later. Earlier versions
+// may not position the mouse correctly.
 //
 // Absolute mouse motion doesn't work in many games, so this mode should not be the default
 // for mice when streaming. It may be desirable as the default touchscreen behavior if the
@@ -522,6 +553,58 @@ int LiGetPendingAudioFrames(void);
 // milliseconds rather than frames, which allows callers to be agnostic of the
 // negotiated audio frame duration.
 int LiGetPendingAudioDuration(void);
+
+// Port index flags for use with LiGetPortFromPortFlagIndex() and LiGetProtocolFromPortFlagIndex()
+#define ML_PORT_INDEX_TCP_47984 0
+#define ML_PORT_INDEX_TCP_47989 1
+#define ML_PORT_INDEX_TCP_48010 2
+#define ML_PORT_INDEX_UDP_47998 8
+#define ML_PORT_INDEX_UDP_47999 9
+#define ML_PORT_INDEX_UDP_48000 10
+#define ML_PORT_INDEX_UDP_48010 11
+
+// Port flags for use with LiTestClientConnectivity()
+#define ML_PORT_FLAG_ALL       0xFFFFFFFF
+#define ML_PORT_FLAG_TCP_47984 0x0001
+#define ML_PORT_FLAG_TCP_47989 0x0002
+#define ML_PORT_FLAG_TCP_48010 0x0004
+#define ML_PORT_FLAG_UDP_47998 0x0100
+#define ML_PORT_FLAG_UDP_47999 0x0200
+#define ML_PORT_FLAG_UDP_48000 0x0400
+#define ML_PORT_FLAG_UDP_48010 0x0800
+
+// Returns the port flags that correspond to ports involved in a failing connection stage, or
+// connection termination error.
+//
+// These may be used to specifically test the ports that could have caused the connection failure.
+// If no ports are likely involved with a given failure, this function returns 0.
+unsigned int LiGetPortFlagsFromStage(int stage);
+unsigned int LiGetPortFlagsFromTerminationErrorCode(int errorCode);
+
+// Returns the IPPROTO_* value for the specified port index 
+int LiGetProtocolFromPortFlagIndex(int portFlagIndex);
+
+// Returns the port number for the specified port index
+unsigned short LiGetPortFromPortFlagIndex(int portFlagIndex);
+
+// Populates the output buffer with a stringified list of the port flags set in the input argument.
+// The second and subsequent entries will be prepended by 'separator' (if provided).
+// If the output buffer is too small, the output will be truncated to fit the provided buffer.
+void LiStringifyPortFlags(unsigned int portFlags, const char* separator, char* outputBuffer, int outputBufferLength);
+
+// This function may be used to test if the local network is blocking Moonlight's ports. It requires
+// a test server running on an Internet-reachable host. To perform a test, pass in the DNS hostname
+// of the test server, a reference TCP port to ensure the test host is reachable at all (something
+// very unlikely to blocked, like 80 or 443), and a set of ML_PORT_FLAG_* values corresponding to
+// the ports you'd like to test. On return, it returns ML_TEST_RESULT_INCONCLUSIVE on catastrophic error,
+// or the set of port flags that failed to validate. If all ports validate successfully, it returns 0.
+//
+// It's encouraged to not use the port flags explicitly (because GameStream ports may change in the future),
+// but to instead use ML_PORT_FLAG_ALL or LiGetPortFlagsFromStage() on connection failure.
+//
+// The test server is available at https://github.com/cgutman/gfe-loopback
+#define ML_TEST_RESULT_INCONCLUSIVE 0xFFFFFFFF
+unsigned int LiTestClientConnectivity(const char* testServer, unsigned short referencePort, unsigned int testPortFlags);
 
 #ifdef __cplusplus
 }

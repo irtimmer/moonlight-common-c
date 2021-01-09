@@ -19,9 +19,9 @@ extern CONNECTION_LISTENER_CALLBACKS ListenerCallbacks;
 extern DECODER_RENDERER_CALLBACKS VideoCallbacks;
 extern AUDIO_RENDERER_CALLBACKS AudioCallbacks;
 extern int NegotiatedVideoFormat;
-extern volatile int ConnectionInterrupted;
-extern int HighQualitySurroundSupported;
-extern int HighQualitySurroundEnabled;
+extern volatile bool ConnectionInterrupted;
+extern bool HighQualitySurroundSupported;
+extern bool HighQualitySurroundEnabled;
 extern OPUS_MULTISTREAM_CONFIGURATION NormalQualityOpusConfig;
 extern OPUS_MULTISTREAM_CONFIGURATION HighQualityOpusConfig;
 extern int OriginalVideoBitrate;
@@ -54,7 +54,8 @@ extern int AudioPacketDuration;
 
 int serviceEnetHost(ENetHost* client, ENetEvent* event, enet_uint32 timeoutMs);
 int extractVersionQuadFromString(const char* string, int* quad);
-int isReferenceFrameInvalidationEnabled(void);
+bool isReferenceFrameInvalidationEnabled(void);
+void* extendBuffer(void* ptr, size_t newSize);
 
 void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
     PCONNECTION_LISTENER_CALLBACKS* clCallbacks);
@@ -83,6 +84,7 @@ void requestDecoderRefresh(void);
 void initializeVideoStream(void);
 void destroyVideoStream(void);
 int startVideoStream(void* rendererContext, int drFlags);
+void submitFrame(PQUEUED_DECODE_UNIT qdu);
 void stopVideoStream(void);
 
 void initializeAudioStream(void);

@@ -63,7 +63,15 @@ int extractVersionQuadFromString(const char* string, int* quad) {
     return 0;
 }
 
-int isReferenceFrameInvalidationEnabled(void) {
+void* extendBuffer(void* ptr, size_t newSize) {
+    void* newBuf = realloc(ptr, newSize);
+    if (newBuf == NULL && ptr != NULL) {
+        free(ptr);
+    }
+    return newBuf;
+}
+
+bool isReferenceFrameInvalidationEnabled(void) {
     LC_ASSERT(NegotiatedVideoFormat != 0);
     return ((NegotiatedVideoFormat & VIDEO_FORMAT_MASK_H264) && (VideoCallbacks.capabilities & CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC)) ||
            ((NegotiatedVideoFormat & VIDEO_FORMAT_MASK_H265) && (VideoCallbacks.capabilities & CAPABILITY_REFERENCE_FRAME_INVALIDATION_HEVC));

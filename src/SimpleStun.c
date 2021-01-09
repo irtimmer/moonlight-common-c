@@ -53,6 +53,8 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
         char buf[1024];
     } resp;
 
+    sock = INVALID_SOCKET;
+
     err = initializePlatformSockets();
     if (err != 0) {
         Limelog("Failed to initialize sockets: %d\n", err);
@@ -102,16 +104,14 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
 
                 // Wait UDP_RECV_POLL_TIMEOUT_MS before moving on to the next server to
                 // avoid having to spam the other STUN servers if we find a working one.
-                bytesRead = recvUdpSocket(sock, resp.buf, sizeof(resp.buf), 1);
+                bytesRead = recvUdpSocket(sock, resp.buf, sizeof(resp.buf), true);
             }
         }
         else {
             // This waits in UDP_RECV_POLL_TIMEOUT_MS increments
-            bytesRead = recvUdpSocket(sock, resp.buf, sizeof(resp.buf), 1);
+            bytesRead = recvUdpSocket(sock, resp.buf, sizeof(resp.buf), true);
         }
     }
-
-    closeSocket(sock);
 
     if (bytesRead == 0) {
         Limelog("No response from STUN server\n");
@@ -123,7 +123,7 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
         Limelog("Failed to read STUN binding response: %d\n", err);
         goto Exit;
     }
-    else if (bytesRead < sizeof(resp.hdr)) {
+    else if (bytesRead < (int)sizeof(resp.hdr)) {
         Limelog("STUN message truncated: %d\n", bytesRead);
         err = -3;
         goto Exit;
@@ -146,8 +146,8 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
 
     attribute = (PSTUN_ATTRIBUTE_HEADER)(&resp.hdr + 1);
     bytesRead -= sizeof(resp.hdr);
-    while (bytesRead > sizeof(*attribute)) {
-        if (bytesRead < sizeof(*attribute) + htons(attribute->length)) {
+    while (bytesRead > (int)sizeof(*attribute)) {
+        if (bytesRead < (int)(sizeof(*attribute) + htons(attribute->length))) {
             Limelog("STUN attribute out of bounds: %d\n", htons(attribute->length));
             err = -5;
             goto Exit;
@@ -183,6 +183,10 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
     err = -6;
 
 Exit:
+    if (sock != INVALID_SOCKET) {
+        closeSocket(sock);
+    }
+
     if (stunAddrs != NULL) {
         freeaddrinfo(stunAddrs);
     }

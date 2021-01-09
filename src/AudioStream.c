@@ -15,7 +15,7 @@ static PLT_THREAD decoderThread;
 
 static unsigned short lastSeq;
 
-static int receivedDataFromPeer;
+static bool receivedDataFromPeer;
 
 #define RTP_PORT 48000
 
@@ -42,7 +42,7 @@ void initializeAudioStream(void) {
     LbqInitializeLinkedBlockingQueue(&packetQueue, 30);
     RtpqInitializeQueue(&rtpReorderQueue, RTPQ_DEFAULT_MAX_SIZE, RTPQ_DEFAULT_QUEUE_TIME);
     lastSeq = 0;
-    receivedDataFromPeer = 0;
+    receivedDataFromPeer = false;
 }
 
 static void freePacketList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
@@ -82,17 +82,11 @@ static void UdpPingThreadProc(void* context) {
             return;
         }
 
-        // Send less frequently if we've received data from our peer
-        if (receivedDataFromPeer) {
-            PltSleepMsInterruptible(&udpPingThread, 5000);
-        }
-        else {
-            PltSleepMsInterruptible(&udpPingThread, 1000);
-        }
+        PltSleepMsInterruptible(&udpPingThread, 500);
     }
 }
 
-static int queuePacketToLbq(PQUEUED_AUDIO_PACKET* packet) {
+static bool queuePacketToLbq(PQUEUED_AUDIO_PACKET* packet) {
     int err;
 
     err = LbqOfferQueueItem(&packetQueue, *packet, &(*packet)->q.lentry);
@@ -105,10 +99,10 @@ static int queuePacketToLbq(PQUEUED_AUDIO_PACKET* packet) {
         freePacketList(LbqFlushQueueItems(&packetQueue));
     }
     else if (err == LBQ_INTERRUPTED) {
-        return 0;
+        return false;
     }
 
-    return 1;
+    return true;
 }
 
 static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
@@ -130,20 +124,22 @@ static void ReceiveThreadProc(void* context) {
     PRTP_PACKET rtp;
     PQUEUED_AUDIO_PACKET packet;
     int queueStatus;
-    int useSelect;
+    bool useSelect;
     int packetsToDrop = 500 / AudioPacketDuration;
+    int waitingForAudioMs;
 
     packet = NULL;
 
     if (setNonFatalRecvTimeoutMs(rtpSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
         // SO_RCVTIMEO failed, so use select() to wait
-        useSelect = 1;
+        useSelect = true;
     }
     else {
         // SO_RCVTIMEO timeout set for recv()
-        useSelect = 0;
+        useSelect = false;
     }
 
+    waitingForAudioMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         if (packet == NULL) {
             packet = (PQUEUED_AUDIO_PACKET)malloc(sizeof(*packet));
@@ -162,6 +158,10 @@ static void ReceiveThreadProc(void* context) {
         }
         else if (packet->size == 0) {
             // Receive timed out; try again
+            
+            if (!receivedDataFromPeer) {
+                waitingForAudioMs += UDP_RECV_POLL_TIMEOUT_MS;
+            }
 
             // If we hit this path, there are no queued audio packets on the host PC,
             // so we don't need to drop anything.
@@ -169,7 +169,7 @@ static void ReceiveThreadProc(void* context) {
             continue;
         }
 
-        if (packet->size < sizeof(RTP_PACKET)) {
+        if (packet->size < (int)sizeof(RTP_PACKET)) {
             // Runt packet
             continue;
         }
@@ -180,9 +180,10 @@ static void ReceiveThreadProc(void* context) {
             continue;
         }
 
-        // We've received data, so we can stop sending our ping packets
-        // as quickly, since we're now just keeping the NAT session open.
-        receivedDataFromPeer = 1;
+        if (!receivedDataFromPeer) {
+            receivedDataFromPeer = true;
+            Limelog("Received first audio packet after %d ms\n", waitingForAudioMs);
+        }
 
         // GFE accumulates audio samples before we are ready to receive them,
         // so we will drop the first 100 packets to avoid accumulating latency
@@ -261,6 +262,10 @@ static void DecoderThreadProc(void* context) {
 }
 
 void stopAudioStream(void) {
+    if (!receivedDataFromPeer) {
+        Limelog("No audio traffic was ever received from the host!\n");
+    }
+
     AudioCallbacks.stop();
 
     PltInterruptThread(&udpPingThread);

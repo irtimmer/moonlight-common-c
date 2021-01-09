@@ -1,16 +1,14 @@
 #define _GNU_SOURCE
 
-#include "PlatformThreads.h"
 #include "Platform.h"
+#include "PlatformThreads.h"
+#include "PlatformSockets.h"
 
 #include <enet/enet.h>
 
 // The maximum amount of time before observing an interrupt
 // in PltSleepMsInterruptible().
 #define INTERRUPT_PERIOD_MS 50
-
-int initializePlatformSockets(void);
-void cleanupPlatformSockets(void);
 
 struct thread_context {
     ThreadEntry entry;
@@ -93,7 +91,7 @@ void* ThreadProc(void* context) {
     ctx->entry(ctx->context);
 
 #if defined(__vita__)
-    ctx->thread->alive = 0;
+    ctx->thread->alive = false;
 #else
     free(ctx);
 #endif
@@ -161,7 +159,7 @@ void PltLockMutex(PLT_MUTEX* mutex) {
     int err;
     err = WaitForSingleObjectEx(*mutex, INFINITE, FALSE);
     if (err != WAIT_OBJECT_0) {
-        LC_ASSERT(FALSE);
+        LC_ASSERT(false);
     }
 #elif defined(__vita__)
     sceKernelLockMutex(*mutex, 1, NULL);
@@ -204,12 +202,12 @@ void PltCloseThread(PLT_THREAD* thread) {
 #endif
 }
 
-int PltIsThreadInterrupted(PLT_THREAD* thread) {
+bool PltIsThreadInterrupted(PLT_THREAD* thread) {
     return thread->cancelled;
 }
 
 void PltInterruptThread(PLT_THREAD* thread) {
-    thread->cancelled = 1;
+    thread->cancelled = true;
 }
 
 int PltCreateThread(const char* name, ThreadEntry entry, void* context, PLT_THREAD* thread) {
@@ -224,7 +222,7 @@ int PltCreateThread(const char* name, ThreadEntry entry, void* context, PLT_THRE
     ctx->context = context;
     ctx->name = name;
     
-    thread->cancelled = 0;
+    thread->cancelled = false;
 
 #if defined(LC_WINDOWS)
     {
@@ -236,7 +234,7 @@ int PltCreateThread(const char* name, ThreadEntry entry, void* context, PLT_THRE
     }
 #elif defined(__vita__)
     {
-        thread->alive = 1;
+        thread->alive = true;
         thread->context = ctx;
         ctx->thread = thread;
         thread->handle = sceKernelCreateThread(name, ThreadProc, 0, 0x40000, 0, 0, NULL);
@@ -277,11 +275,11 @@ int PltCreateEvent(PLT_EVENT* event) {
         sceKernelDeleteMutex(event->mutex);
         return -1;
     }
-    event->signalled = 0;
+    event->signalled = false;
 #else
     pthread_mutex_init(&event->mutex, NULL);
     pthread_cond_init(&event->cond, NULL);
-    event->signalled = 0;
+    event->signalled = false;
 #endif
     activeEvents++;
     return 0;
@@ -305,12 +303,12 @@ void PltSetEvent(PLT_EVENT* event) {
     SetEvent(*event);
 #elif defined(__vita__)
     sceKernelLockMutex(event->mutex, 1, NULL);
-    event->signalled = 1;
+    event->signalled = true;
     sceKernelUnlockMutex(event->mutex, 1);
     sceKernelSignalCondAll(event->cond);
 #else
     pthread_mutex_lock(&event->mutex);
-    event->signalled = 1;
+    event->signalled = true;
     pthread_mutex_unlock(&event->mutex);
     pthread_cond_broadcast(&event->cond);
 #endif
@@ -320,7 +318,7 @@ void PltClearEvent(PLT_EVENT* event) {
 #if defined(LC_WINDOWS)
     ResetEvent(*event);
 #else
-    event->signalled = 0;
+    event->signalled = false;
 #endif
 }
 
@@ -333,7 +331,7 @@ int PltWaitForEvent(PLT_EVENT* event) {
         return PLT_WAIT_SUCCESS;
     }
     else {
-        LC_ASSERT(0);
+        LC_ASSERT(false);
         return -1;
     }
 #elif defined(__vita__)
@@ -386,10 +384,14 @@ int initializePlatform(void) {
         return err;
     }
 
+    enterLowLatencyMode();
+
 	return 0;
 }
 
 void cleanupPlatform(void) {
+    exitLowLatencyMode();
+
     cleanupPlatformSockets();
     
     enet_deinitialize();

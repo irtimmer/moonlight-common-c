@@ -246,9 +246,23 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     
     err |= addAttributeString(&optionHead, "x-nv-vqos[0].videoQualityScoreUpdateTime", "5000");
 
-    // Enable DSCP marking to hopefully increase QoS priority
-    err |= addAttributeString(&optionHead, "x-nv-vqos[0].qosTrafficType", "5");
-    err |= addAttributeString(&optionHead, "x-nv-aqos.qosTrafficType", "4");
+    // If the remote host is local (RFC 1918), enable QoS tagging for our traffic. Windows qWave
+    // will disable it if the host is off-link, *however* Windows may get it wrong in cases where
+    // the host is directly connected to the Internet without a NAT. In this case, it may send DSCP
+    // marked traffic off-link and it could lead to black holes due to misconfigured ISP hardware
+    // or CPE. For this reason, we only enable it in cases where it looks like it will work.
+    //
+    // Even though IPv6 hardware should be much less likely to have this issue, we can't tell
+    // if our address is a NAT64 synthesized IPv6 address or true end-to-end IPv6. If it's the
+    // former, it may have the same problem as other IPv4 traffic.
+    if (StreamConfig.streamingRemotely == STREAM_CFG_LOCAL) {
+        err |= addAttributeString(&optionHead, "x-nv-vqos[0].qosTrafficType", "5");
+        err |= addAttributeString(&optionHead, "x-nv-aqos.qosTrafficType", "4");
+    }
+    else {
+        err |= addAttributeString(&optionHead, "x-nv-vqos[0].qosTrafficType", "0");
+        err |= addAttributeString(&optionHead, "x-nv-aqos.qosTrafficType", "0");
+    }
 
     if (AppVersionQuad[0] == 3) {
         err |= addGen3Options(&optionHead, urlSafeAddr);
@@ -351,14 +365,14 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
 
             // Let the audio stream code know that it needs to disable coupled streams when
             // decoding this audio stream.
-            HighQualitySurroundEnabled = 1;
+            HighQualitySurroundEnabled = true;
 
             // Use 5 ms frames since we don't have a slow decoder
             AudioPacketDuration = 5;
         }
         else {
             err |= addAttributeString(&optionHead, "x-nv-audio.surround.AudioQuality", "0");
-            HighQualitySurroundEnabled = 0;
+            HighQualitySurroundEnabled = false;
 
             if ((AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) != 0) {
                 // Use 20 ms packets for slow decoders to save CPU time
@@ -383,7 +397,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         AudioPacketDuration = 5;
 
         // High quality audio mode not supported on legacy servers
-        HighQualitySurroundEnabled = 0;
+        HighQualitySurroundEnabled = false;
     }
 
     if (AppVersionQuad[0] >= 7) {
